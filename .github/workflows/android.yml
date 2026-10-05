@@ -46,11 +46,20 @@ jobs:
       - name: Install Android SDK packages
         run: yes | sdkmanager "platforms;android-36" "build-tools;36.0.0"
 
+      - name: Configure Gradle memory
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.gradle"
+          cat >> "$HOME/.gradle/gradle.properties" <<'EOF'
+          org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=512m -XX:+HeapDumpOnOutOfMemoryError
+          android.injected.aapt2.worker.enable=false
+          EOF
+
       - name: Build debug APK
-        run: gradle --no-daemon :app:assembleDebug
+        run: gradle --no-daemon :app:assembleDebug --stacktrace
 
       - name: Run unit tests
-        run: gradle --no-daemon :app:testDebugUnitTest
+        run: gradle --no-daemon :app:testDebugUnitTest --stacktrace
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
