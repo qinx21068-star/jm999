@@ -46,14 +46,11 @@ jobs:
       - name: Install Android SDK packages
         run: yes | sdkmanager "platforms;android-36" "build-tools;36.0.0"
 
-      - name: Make Gradle executable
-        run: chmod +x ./gradlew
-
       - name: Build debug APK
-        run: ./gradlew --no-daemon :app:assembleDebug
+        run: gradle --no-daemon :app:assembleDebug
 
       - name: Run unit tests
-        run: ./gradlew --no-daemon :app:testDebugUnitTest
+        run: gradle --no-daemon :app:testDebugUnitTest
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
@@ -103,15 +100,12 @@ jobs:
             echo "No production keystore configured; building an unsigned release APK."
           fi
 
-      - name: Make Gradle executable
-        run: chmod +x ./gradlew
-
       - name: Build release APK
         env:
           JM_KEYSTORE_PW: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           JM_KEY_PW: ${{ secrets.ANDROID_KEY_PASSWORD }}
           JM_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-        run: ./gradlew --no-daemon :app:assembleRelease --stacktrace
+        run: gradle --no-daemon :app:assembleRelease --stacktrace
 
       - name: Upload release APK artifact
         uses: actions/upload-artifact@v4
