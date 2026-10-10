@@ -2,7 +2,6 @@ package com.jmreader.data.api.direct
 
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import okhttp3.OkHttpClient
@@ -68,7 +67,9 @@ class CancellableHttpTest {
                         responseReady.complete(Unit)
                         response.body!!.string()
                     }
-                } catch (_: IOException) { /* Cancellation can arrive as a socket IOException while reading. */ }
+                } catch (_: IOException) {
+                    // OkHttp may surface cancellation as an IOException while the body is reading.
+                }
             }
             withTimeout(2_000) { responseReady.await() }
             withTimeout(2_000) { job.cancelAndJoin() }
