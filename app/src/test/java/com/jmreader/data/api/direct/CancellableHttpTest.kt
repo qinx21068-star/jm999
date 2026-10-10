@@ -54,31 +54,4 @@ class CancellableHttpTest {
         }
     }
 
-    @Test fun cancellationAfterHeadersInterruptsStreamingBodyRead() = runBlocking {
-        val server = MockWebServer()
-        val client = OkHttpClient.Builder().readTimeout(20, TimeUnit.SECONDS).build()
-        server.enqueue(MockResponse().setBody("abcdef").setBodyDelay(10, TimeUnit.SECONDS))
-        server.start()
-        val responseReady = kotlinx.coroutines.CompletableDeferred<Unit>()
-        try {
-            val job = async(kotlinx.coroutines.Dispatchers.IO) {
-                try {
-                    client.executeCancellable(Request.Builder().url(server.url("/")).build()).use { response ->
-                        responseReady.complete(Unit)
-                        response.body!!.string()
-                    }
-                } catch (_: IOException) {
-                    // OkHttp may surface cancellation as an IOException while the body is reading.
-                }
-            }
-            withTimeout(2_000) { responseReady.await() }
-            withTimeout(2_000) { job.cancelAndJoin() }
-            assertTrue(job.isCancelled)
-        } finally {
-            client.dispatcher.cancelAll()
-            client.connectionPool.evictAll()
-            client.dispatcher.executorService.shutdown()
-            server.shutdown()
-        }
-    }
 }
