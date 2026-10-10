@@ -149,22 +149,22 @@ fun JMApp(container: AppContainer) {
             modifier = Modifier.padding(inner),
             enterTransition = {
                 androidx.compose.animation.fadeIn(
-                    animationSpec = androidx.compose.animation.core.tween(180),
+                    animationSpec = androidx.compose.animation.core.tween(if (settings.uiAnimations) 180 else 0),
                 )
             },
             exitTransition = {
                 androidx.compose.animation.fadeOut(
-                    animationSpec = androidx.compose.animation.core.tween(140),
+                    animationSpec = androidx.compose.animation.core.tween(if (settings.uiAnimations) 140 else 0),
                 )
             },
             popEnterTransition = {
                 androidx.compose.animation.fadeIn(
-                    animationSpec = androidx.compose.animation.core.tween(180),
+                    animationSpec = androidx.compose.animation.core.tween(if (settings.uiAnimations) 180 else 0),
                 )
             },
             popExitTransition = {
                 androidx.compose.animation.fadeOut(
-                    animationSpec = androidx.compose.animation.core.tween(140),
+                    animationSpec = androidx.compose.animation.core.tween(if (settings.uiAnimations) 140 else 0),
                 )
             },
         ) {

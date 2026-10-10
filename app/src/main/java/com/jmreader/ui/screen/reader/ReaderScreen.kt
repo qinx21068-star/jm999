@@ -89,6 +89,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -133,6 +134,7 @@ class ReaderViewModel(
     fun load() {
         // 关键修复：取消上一次未完成的 load，避免连点下一章时旧请求覆盖新章节 state
         loadJob?.cancel()
+        preloadJob?.cancel()
         // 同步置 loading=true 并禁用保存：让 UI 立即卸载旧 Pager（取消其 LaunchedEffect
         // 和 snapshotFlow collect），避免切章瞬间旧章页码串写到新章进度。
         saveEnabled = false
@@ -160,21 +162,25 @@ class ReaderViewModel(
                 // 优先读本地离线图片
                 val local = container.downloadManager.listLocalFiles(comicId, chapterId)
                 if (local.isNotEmpty()) {
-                    val (prev, next) = computePrevNext()
-                    val chTitle = cachedDetail?.chapters?.firstOrNull { it.id == chapterId }?.title
+                    // 离线章节先出图；章节前后关系属于辅助信息，不能阻塞本地阅读。
                     _state.value = ReaderUiState(
                         loading = false,
-                        // v27.6：listLocalFiles 现在返回 List<String>（路径或 content:// URI）
                         imageFiles = local,
                         fromLocal = true,
-                        title = chTitle ?: chapterId,
-                        prevChapterId = prev,
-                        nextChapterId = next,
+                        title = chapterId,
                         initialPage = safeInitial,
                     )
-                    com.jmreader.core.Logger.i("Reader", "本地图片 ${local.size} 张")
                     saveEnabled = true
-                    // v27.5 #2：预加载下一章图片列表（仅触发章节接口，不下载图片本体）
+                    val (prev, next) = kotlinx.coroutines.withTimeoutOrNull(2_500L) {
+                        computePrevNext()
+                    } ?: (null to null)
+                    val chapterTitle = cachedDetail?.chapters?.firstOrNull { it.id == chapterId }?.title
+                    _state.value = _state.value.copy(
+                        prevChapterId = prev,
+                        nextChapterId = next,
+                        title = chapterTitle?.ifBlank { null } ?: _state.value.title,
+                    )
+                    com.jmreader.core.Logger.i("Reader", "本地图片 ${local.size} 张")
                     if (settings.preloadNextChapter) preloadNextChapter(next)
                     return@launch
                 }
@@ -182,7 +188,7 @@ class ReaderViewModel(
                 val useBackend = serverUrl.isNotBlank()
                 when (val r = container.repository.chapterImages(chapterId)) {
                     is Resource.Success -> {
-                        val (prev, next) = computePrevNext()
+                        // Render the page list before optional album metadata is available.
                         // 直连模式：图片 URL 已带 jm_sid 标记，JmImageFetcher 会自动解密
                         // 后端模式：套后端代理 URL 解密
                         val imgs = if (useBackend) {
@@ -195,13 +201,14 @@ class ReaderViewModel(
                             imageFiles = imgs,
                             fromLocal = false,
                             title = r.data.title ?: chapterId,
-                            prevChapterId = prev,
-                            nextChapterId = next,
+                            prevChapterId = null,
+                            nextChapterId = null,
                             initialPage = safeInitial,
                         )
                         com.jmreader.core.Logger.i("Reader", "远程图片 ${r.data.images.size} 张, 模式=${if (useBackend) "后端" else "直连"}, 恢复页=$safeInitial")
                         saveEnabled = true
-                        // v27.5 #2：预加载下一章图片列表，避免翻章白屏
+                        val (prev, next) = kotlinx.coroutines.withTimeoutOrNull(2_500L) { computePrevNext() } ?: (null to null)
+                        _state.value = _state.value.copy(prevChapterId = prev, nextChapterId = next)
                         if (settings.preloadNextChapter) preloadNextChapter(next)
                     }
                     is Resource.Error -> {
@@ -239,6 +246,12 @@ class ReaderViewModel(
         preloadJob?.cancel()
         preloadJob = viewModelScope.launch {
             try {
+                delay(1_000L)
+                val device = container.deviceConditions.snapshot()
+                val settings = container.settingsStore.currentSnapshot
+                if (!settings.preloadNextChapter || !device.online || (device.lowBattery && settings.prefetchDisableLowBattery)) return@launch
+                val count = if (device.wifi) settings.prefetchWifiPages else settings.prefetchMobilePages
+                if (count == 0) return@launch
                 com.jmreader.core.Logger.d("Reader", "预加载下一章: $nextId")
                 val r = container.repository.chapterImages(nextId)
                 val urls = (r as? Resource.Success)?.data?.images ?: return@launch
@@ -246,12 +259,14 @@ class ReaderViewModel(
                 // v27.13：预取前 5 张到 Coil 磁盘缓存
                 val ctx = container.applicationContext
                 val loader = coil.Coil.imageLoader(ctx)
-                val prefetchCount = minOf(5, urls.size)
+                val prefetchCount = minOf(count, urls.size)
                 for (i in 0 until prefetchCount) {
                     val req = coil.request.ImageRequest.Builder(ctx)
-                        .data(urls[i])
+                        .data(if (settings.serverUrl.isBlank()) urls[i] else proxiedImageUrl(settings.serverUrl, urls[i]))
+                        .memoryCachePolicy(coil.request.CachePolicy.DISABLED)
+                        .size(1, 1)
                         .build()
-                    loader.enqueue(req)
+                    loader.execute(req)
                 }
                 com.jmreader.core.Logger.d("Reader", "预取下一章 $prefetchCount 张图片到磁盘缓存")
             } catch (e: kotlinx.coroutines.CancellationException) {
@@ -313,10 +328,14 @@ class ReaderViewModel(
             if (incognito) return@launch
             try {
                 val detail = cachedDetail
-                if (detail != null) {
-                    val brief = ComicBriefDto(detail.id, detail.name, detail.author, detail.tags, detail.cover)
-                    container.historyStore.upsert(brief, snapChapterId, snapTitle, page)
+                val brief = if (detail != null) {
+                    ComicBriefDto(detail.id, detail.name, detail.author, detail.tags, detail.cover)
+                } else {
+                    // 章节已能显示但 /album 可能失败时也保存进度，避免离线阅读丢失。
+                    ComicBriefDto(id = comicId, name = comicId, cover = null)
                 }
+                container.historyStore.upsert(brief, snapChapterId, snapTitle, page)
+                if (detail != null && container.favoriteUpdatesStore.items.value.any { it.comicId == comicId && it.hasUpdate }) container.favoriteUpdatesStore.markRead(comicId, detail.chapters.map { it.id }.toSet())
                 // 关键修复（Bug 44）：移除 setReadingPosition 调用。
                 // lastComicId/lastChapterId/lastPageIndex 三个字段全工程无任何读取方
                 // （进度恢复走 HistoryStore 按 comicId+chapterId 双键查），
@@ -339,7 +358,7 @@ class ReaderViewModel(
         val detail = cachedDetail
         val ch = chapterId
         val title = state.value.title
-        if (page >= 0 && detail != null) {
+        if (page >= 0) {
             // 用 appScope 替代反模式 GlobalScope：appScope 生命周期与 App 进程一致，
             // 比 viewModelScope 存活更久，进程退出前有机会完成落盘。
             // v27.5 稳定性加固：appScope 已加 CrashHandler.coroutineHandler 兜底，
@@ -352,7 +371,11 @@ class ReaderViewModel(
                         container.settingsStore.settings.first().incognito
                     }.getOrDefault(false)
                     if (incognito) return@launch
-                    val brief = ComicBriefDto(detail.id, detail.name, detail.author, detail.tags, detail.cover)
+                    val brief = if (detail != null) {
+                        ComicBriefDto(detail.id, detail.name, detail.author, detail.tags, detail.cover)
+                    } else {
+                        ComicBriefDto(id = comicId, name = comicId)
+                    }
                     container.historyStore.upsert(brief, ch, title, page)
                     // Bug 44：setReadingPosition 已移除（死写入，详见 saveProgress 注释）
                 } catch (e: kotlinx.coroutines.CancellationException) {
@@ -387,6 +410,14 @@ fun ReaderScreen(
     val state by vm.state.collectAsState()
     // v27.5 性能优化：用 cachedSnapshot 作为初始值，避免 null → 默认 → 真实 两轮重组
     val settings by container.settingsStore.settings.collectAsState(initial = container.settingsStore.cachedSnapshot)
+    val device by container.deviceConditions.state.collectAsState()
+    var previouslyOnline by remember { mutableStateOf(device.online) }
+    LaunchedEffect(device.online) {
+        if (device.online && !previouslyOnline && state.error != null) vm.load()
+        previouslyOnline = device.online
+    }
+    val prefetchPages = if (!device.online || (device.lowBattery && settings.prefetchDisableLowBattery)) 0
+        else if (device.wifi) settings.prefetchWifiPages else settings.prefetchMobilePages
     val direction = settings.readerDirection
     val volumeKeyPaging = settings.volumeKeyPaging
     // v27.5 #5：阅读器增强设置
@@ -403,9 +434,11 @@ fun ReaderScreen(
     val nightModeFilter = settings.nightModeFilter
     val nightModeFilterStrength = settings.nightModeFilterStrength
     val immersiveReader = settings.immersiveReader
-    val activity = LocalContext.current as? Activity
+    val context = LocalContext.current
+    val activity = context as? Activity
 
     var uiVisible by remember { mutableStateOf(true) }
+    var showLineSheet by remember { mutableStateOf(false) }
     // 阅读进度恢复提示：进入章节自动滚到上次位置后，弹 snackbar 告知用户
     val jumpSnackbar = remember { androidx.compose.material3.SnackbarHostState() }
     val jumpScope = androidx.compose.runtime.rememberCoroutineScope()
@@ -464,10 +497,10 @@ fun ReaderScreen(
     }
 
     // 控制栏显示后自动收起，避免长时间阅读时工具栏遮挡内容。
-    LaunchedEffect(immersiveReader, uiVisible, totalPages) {
-        if (immersiveReader && uiVisible && totalPages > 0) {
+    LaunchedEffect(immersiveReader, uiVisible, totalPages, showLineSheet, isSliderDragging) {
+        if (immersiveReader && uiVisible && totalPages > 0 && !showLineSheet && !isSliderDragging) {
             kotlinx.coroutines.delay(2_500L)
-            uiVisible = false
+            if (!showLineSheet && !isSliderDragging) uiVisible = false
         }
     }
 
@@ -534,9 +567,7 @@ fun ReaderScreen(
         modifier = volumeKeyModifier,
         snackbarHost = { androidx.compose.material3.SnackbarHost(jumpSnackbar) },
         topBar = {
-            if (uiVisible) {
-                // v27.6：线路切换 sheet 状态
-                var showLineSheet by remember { mutableStateOf(false) }
+            androidx.compose.animation.AnimatedVisibility(visible = uiVisible, enter = androidx.compose.animation.fadeIn(androidx.compose.animation.core.tween(if (settings.uiAnimations) 140 else 0)), exit = androidx.compose.animation.fadeOut(androidx.compose.animation.core.tween(if (settings.uiAnimations) 100 else 0))) {
                 TopAppBar(
                     title = {
                         // v27.5 #22：阅读器标题字体大小由设置控制
@@ -564,17 +595,10 @@ fun ReaderScreen(
                         Modifier.statusBarsPadding()
                     },
                 )
-                // v27.6 线路测速切换 Sheet
-                if (showLineSheet) {
-                    LineSpeedTestSheet(
-                        container = container,
-                        onDismiss = { showLineSheet = false },
-                    )
-                }
             }
         },
         bottomBar = {
-            if (uiVisible && totalPages > 0) {
+            androidx.compose.animation.AnimatedVisibility(visible = uiVisible && totalPages > 0, enter = androidx.compose.animation.fadeIn(androidx.compose.animation.core.tween(if (settings.uiAnimations) 140 else 0)), exit = androidx.compose.animation.fadeOut(androidx.compose.animation.core.tween(if (settings.uiAnimations) 100 else 0))) {
                 BottomAppBar(
                     modifier = if (immersiveReader && !uiVisible) {
                         Modifier
@@ -595,27 +619,29 @@ fun ReaderScreen(
                         color = MaterialTheme.colorScheme.onSurface,
                         modifier = Modifier.padding(horizontal = 4.dp),
                     )
-                    Slider(
-                        value = if (isSliderDragging) sliderDragging else currentPage.toFloat(),
-                        onValueChange = {
-                            isSliderDragging = true
-                            sliderDragging = it
-                        },
-                        onValueChangeFinished = {
-                            val target = sliderDragging.toInt().coerceIn(0, totalPages - 1)
-                            isSliderDragging = false
-                            currentPage = target
-                            jumpScope.launch {
-                                if (direction == ReaderDirection.VERTICAL) {
-                                    verticalListState.scrollToItem(target)
-                                } else {
-                                    horizontalPagerState.scrollToPage(target)
+                    if (totalPages > 1) {
+                        Slider(
+                            value = if (isSliderDragging) sliderDragging else currentPage.toFloat(),
+                            onValueChange = {
+                                isSliderDragging = true
+                                sliderDragging = it
+                            },
+                            onValueChangeFinished = {
+                                val target = sliderDragging.toInt().coerceIn(0, totalPages - 1)
+                                isSliderDragging = false
+                                currentPage = target
+                                jumpScope.launch {
+                                    if (direction == ReaderDirection.VERTICAL) {
+                                        verticalListState.scrollToItem(target)
+                                    } else {
+                                        horizontalPagerState.scrollToPage(target)
+                                    }
                                 }
-                            }
-                        },
-                        valueRange = 0f..(totalPages - 1).toFloat().coerceAtLeast(0f),
-                        modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
-                    )
+                            },
+                            valueRange = 0f..(totalPages - 1).toFloat().coerceAtLeast(0f),
+                            modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
+                        )
+                    }
                     IconButton(
                         onClick = { state.nextChapterId?.let { vm.gotoChapter(it) } },
                         enabled = state.nextChapterId != null,
@@ -700,6 +726,8 @@ fun ReaderScreen(
                         readerFontSize = readerFontSize,
                         readerLineSpacing = readerLineSpacing,
                         imageQuality = imageQuality,
+                        prefetchContext = context,
+                        prefetchPages = prefetchPages,
                     )
                 }
             }
@@ -717,6 +745,12 @@ fun ReaderScreen(
                 )
             }
         }
+    }
+    if (showLineSheet) {
+        LineSpeedTestSheet(
+            container = container,
+            onDismiss = { showLineSheet = false },
+        )
     }
 }
 
@@ -739,7 +773,37 @@ private fun ReaderPager(
     readerFontSize: Float = 16f,
     readerLineSpacing: Float = 1.5f,
     imageQuality: com.jmreader.data.local.ImageQuality = com.jmreader.data.local.ImageQuality.HIGH,
+    prefetchContext: android.content.Context? = null,
+    prefetchPages: Int = 2,
 ) {
+    LaunchedEffect(images, direction, imageQuality, prefetchContext, prefetchPages) {
+        if (prefetchContext == null || images.isEmpty() || prefetchPages <= 0) return@LaunchedEffect
+        val loader = coil.Coil.imageLoader(prefetchContext)
+        val prefetches = mutableMapOf<String, coil.request.Disposable>()
+        try {
+            snapshotFlow {
+                if (direction == ReaderDirection.VERTICAL) verticalListState.firstVisibleItemIndex
+                else horizontalPagerState.currentPage
+            }.distinctUntilChanged().collectLatest { page ->
+                // Let the visible page request get a head start before competing for bandwidth.
+                kotlinx.coroutines.delay(180L)
+                val wanted = images.drop(page + 1).take(prefetchPages).filter { it.startsWith("http") }.toSet()
+                val obsolete = prefetches.keys.filter { it !in wanted }
+                obsolete.forEach { key -> prefetches.remove(key)?.dispose() }
+                wanted.filterNot { it in prefetches }.forEach { path ->
+                    val builder = coil.request.ImageRequest.Builder(prefetchContext)
+                        .data(path)
+                        // Warm persistent decoded bytes; avoid decoding original-sized images for no target.
+                        .memoryCachePolicy(coil.request.CachePolicy.DISABLED)
+                        .diskCachePolicy(coil.request.CachePolicy.ENABLED)
+                        .size(1, 1)
+                    prefetches[path] = loader.enqueue(builder.build())
+                }
+            }
+        } finally {
+            prefetches.values.forEach { it.dispose() }
+        }
+    }
     when (direction) {
         ReaderDirection.VERTICAL -> VerticalReader(
             images = images,
@@ -893,7 +957,8 @@ private fun HorizontalReader(
             modifier = Modifier.fillMaxSize(),
             reverseLayout = reverse,
             beyondViewportPageCount = 1,
-            key = { it },
+            // 页码参与 key，避免服务端重复图片 URL 让 HorizontalPager 崩溃。
+            key = { page -> "$page:${images.getOrNull(page)}" }
         ) { page ->
             // 越界保护：page 理论上不会越界，但加保护避免极端情况闪退
             val path = images.getOrNull(page) ?: return@HorizontalPager
@@ -967,6 +1032,7 @@ private fun ReaderImage(
     imageQuality: com.jmreader.data.local.ImageQuality = com.jmreader.data.local.ImageQuality.HIGH,
 ) {
     val ctx = LocalContext.current
+    var retryNonce by remember(path) { mutableStateOf(0) }
     val model = remember(path, imageQuality) {
         when {
             // v27.5 性能修复：移除 crossfade(true)。
@@ -1033,6 +1099,7 @@ private fun ReaderImage(
             }
     }
     Box(modifier = modifier.background(Color(0xFF1A1A1A)), contentAlignment = Alignment.Center) {
+        androidx.compose.runtime.key(path, imageQuality, retryNonce) {
         coil.compose.AsyncImage(
             model = model,
             contentDescription = null,
@@ -1040,6 +1107,7 @@ private fun ReaderImage(
             onState = { imgState = it },
             modifier = imageModifier,
         )
+        }
         when (val s = imgState) {
             is coil.compose.AsyncImagePainter.State.Loading -> {
                 CircularProgressIndicator(color = Color.White, modifier = Modifier.size(36.dp))
@@ -1047,6 +1115,7 @@ private fun ReaderImage(
             is coil.compose.AsyncImagePainter.State.Error -> {
                 com.jmreader.core.Logger.w("Reader", "图片加载失败: $path, ${com.jmreader.core.Logger.brief(s.result.throwable)}")
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    androidx.compose.material3.TextButton(onClick = { retryNonce++ }) { Text("重试这张图片", color = Color.White) }
                     Text("加载失败", color = Color.White, style = MaterialTheme.typography.bodyMedium.copy(fontSize = readerFontSize.sp, lineHeight = (readerFontSize * readerLineSpacing).sp))
                     Text(
                         text = com.jmreader.core.Logger.friendlyError(com.jmreader.core.Logger.brief(s.result.throwable)),
@@ -1100,7 +1169,7 @@ private fun LineSpeedTestSheet(
     // 测速结果：域名 → (延迟ms, 错误信息)
     var results by remember { mutableStateOf<Map<String, Pair<Long?, String?>>>(emptyMap()) }
     var testing by remember { mutableStateOf(false) }
-    val currentDomain = remember { container.directClient.currentDomain() }
+    var currentDomain by remember { mutableStateOf(container.directClient.currentDomain()) }
     val domains = remember { container.directClient.apiDomainList() }
 
     // 进入时自动测速一次
@@ -1111,8 +1180,9 @@ private fun LineSpeedTestSheet(
                 container.directClient.testAllDomains()
             }
             results = rs.associate { it.first to (it.second to it.third) }
-        } catch (_: Throwable) {}
-        testing = false
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (e: Throwable) { com.jmreader.core.Logger.w("Reader", "线路测速失败", e) }
+        finally { testing = false }
     }
 
     androidx.compose.material3.ModalBottomSheet(
@@ -1125,12 +1195,25 @@ private fun LineSpeedTestSheet(
                 .padding(horizontal = 16.dp)
                 .padding(bottom = 24.dp),
         ) {
+            Text(
+                "接口线路测速",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
+            Text(
+                "图片 CDN：${container.directClient.currentImageDomain()}（图片请求失败时自动轮换）",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
             androidx.compose.foundation.layout.Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
                     "线路测速",
+
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.weight(1f),
@@ -1139,14 +1222,15 @@ private fun LineSpeedTestSheet(
                 androidx.compose.material3.TextButton(
                     onClick = {
                         val fastest = results.entries
-                            .filter { it.value.first != null }
+                            .filter { it.value.first != null && it.value.second == null }
                             .minByOrNull { it.value.first!! }
                         if (fastest != null) {
                             container.directClient.selectDomain(fastest.key)
+                            currentDomain = fastest.key
                             onDismiss()
                         }
                     },
-                    enabled = !testing && results.any { it.value.first != null },
+                    enabled = !testing && results.any { it.value.first != null && it.value.second == null },
                 ) { Text("自动选最快") }
                 // 重新测速按钮
                 androidx.compose.material3.TextButton(
@@ -1159,8 +1243,9 @@ private fun LineSpeedTestSheet(
                                     container.directClient.testAllDomains()
                                 }
                                 results = rs.associate { it.first to (it.second to it.third) }
-                            } catch (_: Throwable) {}
-                            testing = false
+                            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                            catch (e: Throwable) { com.jmreader.core.Logger.w("Reader", "线路测速失败", e) }
+                            finally { testing = false }
                         }
                     },
                     enabled = !testing,
@@ -1198,6 +1283,7 @@ private fun LineSpeedTestSheet(
                         )
                         .clickable {
                             container.directClient.selectDomain(host)
+                            currentDomain = host
                             onDismiss()
                         }
                         .padding(vertical = 10.dp, horizontal = 12.dp),
@@ -1214,8 +1300,8 @@ private fun LineSpeedTestSheet(
                         Text(
                             when {
                                 testing && res == null -> "等待中…"
-                                latency != null -> "${latency} ms"
                                 err != null -> "失败：$err"
+                                latency != null -> "${latency} ms"
                                 else -> "未测速"
                             },
                             style = MaterialTheme.typography.bodySmall,

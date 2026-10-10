@@ -12,6 +12,7 @@ import com.squareup.moshi.Types
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import retrofit2.Response
 
@@ -31,6 +32,21 @@ sealed class Resource<out T> {
  * 所有 suspend 方法都在 IO 调度器上执行，避免阻塞 UI。
  */
 class JMRepository(private val container: AppContainer) {
+
+    // Collapse duplicate detail/chapter requests from list enrichment, detail screens,
+    // and reader preloading without changing the repository's public API.
+    private val detailCache = RequestCache<String, Resource<ComicDetailDto>>(
+        scope = container.appScope,
+        ttlMillis = 30_000L,
+        maxEntries = 64,
+        cacheable = { it is Resource.Success },
+    )
+    private val chapterCache = RequestCache<String, Resource<ChapterImagesDto>>(
+        scope = container.appScope,
+        ttlMillis = 15_000L,
+        maxEntries = 32,
+        cacheable = { it is Resource.Success },
+    )
 
     private val moshi: Moshi = com.jmreader.data.api.NetworkFactory.moshi
     private val errorType = Types.newParameterizedType(Map::class.java, String::class.java, Any::class.java)
@@ -133,21 +149,31 @@ class JMRepository(private val container: AppContainer) {
         }
     }
 
-    suspend fun comicDetail(id: String): Resource<ComicDetailDto> = io {
-        if (container.useBackend()) {
-            container.ensureApi().comicDetail(id).toResource()
-        } else {
-            runCatching { container.directClient.albumDetail(id) }
-                .toResource("加载详情失败")
+    suspend fun comicDetail(id: String, forceRefresh: Boolean = false): Resource<ComicDetailDto> = io {
+        val snapshot = container.settingsStore.settings.first()
+        val backend = snapshot.serverUrl.isNotBlank()
+        val endpoint = if (backend) snapshot.serverUrl else "direct"
+        val key = "$endpoint:$id"
+        val loader: suspend () -> Resource<ComicDetailDto> = {
+            if (backend) container.ensureApi().comicDetail(id).toResource()
+            else runCatching { container.directClient.albumDetail(id) }.toResource("加载详情失败")
         }
+        if (forceRefresh) detailCache.refresh(key, loader)
+        else detailCache.getOrLoad(key, loader)
     }
 
     suspend fun chapterImages(id: String): Resource<ChapterImagesDto> = io {
-        if (container.useBackend()) {
-            container.ensureApi().chapterImages(id).toResource()
-        } else {
-            runCatching { container.directClient.chapterImages(id) }
-                .toResource("加载章节图片失败")
+        val snapshot = container.settingsStore.settings.first()
+        val backend = snapshot.serverUrl.isNotBlank()
+        val endpoint = if (backend) snapshot.serverUrl else "direct"
+        val key = "$endpoint:$id"
+        chapterCache.getOrLoad(key) {
+            if (backend) {
+                container.ensureApi().chapterImages(id).toResource()
+            } else {
+                runCatching { container.directClient.chapterImages(id) }
+                    .toResource("加载章节图片失败")
+            }
         }
     }
 
@@ -176,6 +202,8 @@ class JMRepository(private val container: AppContainer) {
             } catch (e: com.jmreader.data.api.direct.SessionExpiredException) {
                 container.directClient.clearSession()
                 Resource.Error("登录已过期，请重新登录")
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Throwable) {
                 Resource.Error("加载评论失败：${com.jmreader.core.Logger.friendlyError(com.jmreader.core.Logger.brief(e))}")
             }
@@ -258,8 +286,11 @@ class JMRepository(private val container: AppContainer) {
         } else {
             // 会话过期同样清登录态引导重新登录（与 serverFavorites 一致）
             try {
-                container.directClient.addFavorite(id)
-                Resource.Success(true)
+                if (container.directClient.addFavorite(id)) {
+                    Resource.Success(true)
+                } else {
+                    Resource.Error("添加收藏失败，请稍后重试")
+                }
             } catch (e: com.jmreader.data.api.direct.SessionExpiredException) {
                 container.directClient.clearSession()
                 container.settingsStore.setLoggedInUser(null)

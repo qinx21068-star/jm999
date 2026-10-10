@@ -115,6 +115,13 @@ data class AppSettings(
     val autoScrollSpeed: Float = 5f,
     /** 预加载下一章图片，避免翻章白屏。 */
     val preloadNextChapter: Boolean = true,
+    /** Adaptive prefetch counts. Zero disables page prefetch on that network. */
+    val prefetchWifiPages: Int = 2,
+    val prefetchMobilePages: Int = 1,
+    val prefetchDisableLowBattery: Boolean = true,
+    val downloadWifiOnly: Boolean = false,
+    val downloadChargingOnly: Boolean = false,
+    val uiAnimations: Boolean = true,
     /** 章节进度记忆到具体页（而非仅记章节）。 */
     val rememberPageLevel: Boolean = true,
     /** 阅读器字体大小 sp（竖向阅读文字模式才用到，本子主要是图片；为图片章节时的标题/页码用）。 */
@@ -226,6 +233,12 @@ class SettingsStore(private val context: Context, scope: CoroutineScope) {
         val AUTO_SCROLL = booleanPreferencesKey("auto_scroll_v27_5")
         val AUTO_SCROLL_SPEED = floatPreferencesKey("auto_scroll_speed_v27_5")
         val PRELOAD_NEXT_CHAPTER = booleanPreferencesKey("preload_next_ch_v27_5")
+        val PREFETCH_WIFI = intPreferencesKey("prefetch_wifi_v1_3")
+        val PREFETCH_MOBILE = intPreferencesKey("prefetch_mobile_v1_3")
+        val PREFETCH_LOW_BATTERY = booleanPreferencesKey("prefetch_low_battery_v1_3")
+        val DOWNLOAD_WIFI_ONLY = booleanPreferencesKey("download_wifi_only_v1_3")
+        val DOWNLOAD_CHARGING_ONLY = booleanPreferencesKey("download_charging_only_v1_3")
+        val UI_ANIMATIONS = booleanPreferencesKey("ui_animations_v1_3")
         val REMEMBER_PAGE_LEVEL = booleanPreferencesKey("remember_page_level_v27_5")
         val READER_FONT_SIZE = floatPreferencesKey("reader_font_size_v27_5")
         val READER_LINE_SPACING = floatPreferencesKey("reader_line_spacing_v27_5")
@@ -311,9 +324,9 @@ class SettingsStore(private val context: Context, scope: CoroutineScope) {
     }
 
     /** 启动时同步可用的应用锁开关，供 MainActivity 冷启动立即判断。 */
-    val appLockEnabled: Boolean get() = cachedSnapshot.appLockEnabled
+    val appLockEnabled: Boolean get() = currentSnapshot.appLockEnabled
     /** 启动时同步可用的应用锁 PIN（null=生物识别模式）。 */
-    val appLockPin: String? get() = cachedSnapshot.appLockPin
+    val appLockPin: String? get() = currentSnapshot.appLockPin
     /** 启动时同步可用的免责声明接受状态。 */
     val disclaimerAccepted: Boolean get() = cachedSnapshot.disclaimerAccepted
 
@@ -333,6 +346,8 @@ class SettingsStore(private val context: Context, scope: CoroutineScope) {
         .map { mapPreferences(it).also { mapped -> latestSnapshot = mapped } }
         .distinctUntilChanged()
         .stateIn(scope, SharingStarted.Eagerly, cachedSnapshot)
+
+    suspend fun committedSnapshot(): AppSettings = readFromDisk().also { latestSnapshot = it }
 
     private suspend fun readFromDisk(): AppSettings = context.dataStore.data.map { mapPreferences(it) }.first()
 
@@ -385,6 +400,12 @@ class SettingsStore(private val context: Context, scope: CoroutineScope) {
         autoScroll = p[Keys.AUTO_SCROLL] ?: false,
         autoScrollSpeed = p[Keys.AUTO_SCROLL_SPEED] ?: 5f,
         preloadNextChapter = p[Keys.PRELOAD_NEXT_CHAPTER] ?: true,
+        prefetchWifiPages = (p[Keys.PREFETCH_WIFI] ?: 2).coerceIn(0, 3),
+        prefetchMobilePages = (p[Keys.PREFETCH_MOBILE] ?: 1).coerceIn(0, 3),
+        prefetchDisableLowBattery = p[Keys.PREFETCH_LOW_BATTERY] ?: true,
+        downloadWifiOnly = p[Keys.DOWNLOAD_WIFI_ONLY] ?: false,
+        downloadChargingOnly = p[Keys.DOWNLOAD_CHARGING_ONLY] ?: false,
+        uiAnimations = p[Keys.UI_ANIMATIONS] ?: true,
         rememberPageLevel = p[Keys.REMEMBER_PAGE_LEVEL] ?: true,
         readerFontSize = p[Keys.READER_FONT_SIZE] ?: 14f,
         readerLineSpacing = p[Keys.READER_LINE_SPACING] ?: 1.2f,
@@ -422,6 +443,87 @@ class SettingsStore(private val context: Context, scope: CoroutineScope) {
         blockMode = runCatching { BlockMode.valueOf(p[Keys.BLOCK_MODE] ?: "HIDE") }.getOrDefault(BlockMode.HIDE),
         readLaterNotificationEnabled = p[Keys.READ_LATER_NOTIFICATION] ?: false,
     )
+
+    private val portablePreferenceNames = setOf("server_url", "theme", "reader_dir", "dynamic_color", "custom_api_domains", "max_refresh_rate", "disclaimer_accepted", "list_style", "volume_key_paging", "color_scheme_id_v27_4", "custom_colors_v27_4", "bg_image_opacity_v27_4", "bg_image_blur_v27_4", "bg_image_light_only_v27_4", "immersive_reader_v1_3", "tap_zone_mode_v27_5", "auto_scroll_v27_5", "auto_scroll_speed_v27_5", "preload_next_ch_v27_5", "prefetch_wifi_v1_3", "prefetch_mobile_v1_3", "prefetch_low_battery_v1_3", "download_wifi_only_v1_3", "download_charging_only_v1_3", "ui_animations_v1_3", "pinch_zoom_v27_5", "remember_page_level_v27_5", "reader_font_size_v27_5", "reader_line_spacing_v27_5", "night_mode_filter_v27_5", "night_mode_filter_strength_v27_5", "card_corner_radius_v27_5", "card_elevation_v27_5", "corner_mode_v27_5", "list_title_font_v27_5", "list_body_font_v27_5", "cover_aspect_v27_5", "tab_bar_style_v27_5", "detail_parallax_v27_5", "splash_anim_v27_5", "incognito_v27_5", "block_screenshots_v27_5", "save_search_history_v27_5", "search_tag_filter_v27_5", "download_concurrency_v27_5", "local_search_v27_5", "image_quality_v27_5", "ranking_period_v27_5", "block_mode")
+
+    /** Portable preferences omit authentication, app-lock secrets and device-local URI grants. */
+    suspend fun exportPortable(): org.json.JSONObject {
+        val out = org.json.JSONObject()
+        context.dataStore.data.first().asMap().forEach { (key, value) ->
+            if (key.name in portablePreferenceNames) {
+                val kind = when (value) {
+                    is Boolean -> "boolean"
+                    is Int -> "int"
+                    is Float -> "float"
+                    is String -> "string"
+                    is Set<*> -> "set"
+                    else -> return@forEach
+                }
+                val raw = if (value is Set<*>) org.json.JSONArray(value.toList()) else value
+                out.put(key.name, org.json.JSONObject().put("type", kind).put("value", raw))
+            }
+        }
+        return out
+    }
+
+    private val portablePreferenceTypes = mapOf("server_url" to "string", "theme" to "string", "reader_dir" to "string", "dynamic_color" to "boolean", "logged_user" to "string", "last_comic" to "string", "last_chapter" to "string", "last_page" to "int", "custom_api_domains" to "set", "max_refresh_rate" to "boolean", "disclaimer_accepted" to "boolean", "list_style" to "string", "volume_key_paging" to "boolean", "color_scheme_id_v27_4" to "string", "custom_colors_v27_4" to "string", "bg_image_uri_v27_4" to "string", "bg_image_opacity_v27_4" to "float", "bg_image_blur_v27_4" to "float", "bg_image_light_only_v27_4" to "boolean", "immersive_reader_v1_3" to "boolean", "tap_zone_mode_v27_5" to "string", "auto_scroll_v27_5" to "boolean", "auto_scroll_speed_v27_5" to "float", "preload_next_ch_v27_5" to "boolean", "prefetch_wifi_v1_3" to "int", "prefetch_mobile_v1_3" to "int", "prefetch_low_battery_v1_3" to "boolean", "download_wifi_only_v1_3" to "boolean", "download_charging_only_v1_3" to "boolean", "ui_animations_v1_3" to "boolean", "remember_page_level_v27_5" to "boolean", "reader_font_size_v27_5" to "float", "reader_line_spacing_v27_5" to "float", "pinch_zoom_v27_5" to "boolean", "night_mode_filter_v27_5" to "boolean", "night_mode_filter_strength_v27_5" to "float", "card_corner_radius_v27_5" to "float", "card_elevation_v27_5" to "float", "corner_mode_v27_5" to "string", "list_title_font_v27_5" to "float", "list_body_font_v27_5" to "float", "cover_aspect_v27_5" to "string", "tab_bar_style_v27_5" to "string", "detail_parallax_v27_5" to "boolean", "splash_anim_v27_5" to "boolean", "app_lock_v27_5" to "boolean", "app_lock_pin_v27_5" to "string", "incognito_v27_5" to "boolean", "block_screenshots_v27_5" to "boolean", "save_search_history_v27_5" to "boolean", "search_tag_filter_v27_5" to "boolean", "download_dir_uri_v27_5" to "string", "download_concurrency_v27_5" to "int", "local_search_v27_5" to "boolean", "image_quality_v27_5" to "string", "pinned_image_cdn_v27_5" to "string", "proxy_v27_5" to "string", "ranking_period_v27_5" to "string", "block_mode" to "string", "read_later_notification_v27_15" to "boolean")
+
+    fun validatePortable(data: org.json.JSONObject) {
+        data.keys().forEach { name ->
+            if (name !in portablePreferenceNames) return@forEach
+            val item = data.getJSONObject(name)
+            require(item.getString("type") == portablePreferenceTypes[name]) { "设置类型不匹配：$name" }
+            when (item.getString("type")) {
+                "boolean" -> item.getBoolean("value")
+                "int" -> { val value = item.getInt("value"); require(if (name.startsWith("prefetch_")) value in 0..3 else value in 1..4) }
+                "float" -> {
+                    val value = item.getDouble("value")
+                    require(value.isFinite())
+                    val range = when (name) {
+                        "reader_font_size_v27_5" -> 10.0..24.0
+                        "reader_line_spacing_v27_5" -> 1.0..2.0
+                        "auto_scroll_speed_v27_5" -> 1.0..30.0
+                        "night_mode_filter_strength_v27_5", "bg_image_opacity_v27_4" -> 0.0..1.0
+                        "bg_image_blur_v27_4" -> 0.0..25.0
+                        "card_corner_radius_v27_5" -> 4.0..24.0
+                        "card_elevation_v27_5" -> 0.0..8.0
+                        "list_title_font_v27_5" -> 10.0..18.0
+                        "list_body_font_v27_5" -> 10.0..16.0
+                        else -> -1_000.0..1_000.0
+                    }
+                    require(value in range) { "设置数值超出范围：$name" }
+                }
+
+                "string" -> require(item.getString("value").length <= 10_000)
+                "set" -> { val values = item.getJSONArray("value"); require(values.length() <= 10_000); (0 until values.length()).forEach { values.getString(it) } }
+            }
+        }
+    }
+
+    suspend fun importPortable(data: org.json.JSONObject, replace: Boolean) {
+        validatePortable(data)
+        val updated = context.dataStore.edit { prefs ->
+            if (replace) prefs.asMap().keys.filter { it.name in portablePreferenceNames }.forEach { key ->
+                @Suppress("UNCHECKED_CAST")
+                prefs.remove(key as Preferences.Key<Any>)
+            }
+            data.keys().forEach { name ->
+                if (name !in portablePreferenceNames) return@forEach
+                val item = data.getJSONObject(name)
+                when (item.getString("type")) {
+                    "boolean" -> prefs[booleanPreferencesKey(name)] = item.getBoolean("value")
+                    "int" -> prefs[intPreferencesKey(name)] = item.getInt("value")
+                    "float" -> prefs[floatPreferencesKey(name)] = item.getDouble("value").toFloat()
+                    "string" -> prefs[stringPreferencesKey(name)] = item.getString("value")
+                    "set" -> {
+                        val values = item.getJSONArray("value")
+                        prefs[stringSetPreferencesKey(name)] = (0 until values.length()).map { values.getString(it) }.toSet()
+                    }
+                }
+            }
+        }
+        latestSnapshot = mapPreferences(updated)
+    }
 
     suspend fun setServerUrl(url: String) = context.dataStore.edit { it[Keys.SERVER_URL] = url }
     suspend fun setThemeMode(mode: ThemeMode) = context.dataStore.edit { it[Keys.THEME] = mode.name }
@@ -472,6 +574,12 @@ class SettingsStore(private val context: Context, scope: CoroutineScope) {
     suspend fun setAutoScroll(v: Boolean) = context.dataStore.edit { it[Keys.AUTO_SCROLL] = v }
     suspend fun setAutoScrollSpeed(v: Float) = context.dataStore.edit { it[Keys.AUTO_SCROLL_SPEED] = v.coerceIn(1f, 30f) }
     suspend fun setPreloadNextChapter(v: Boolean) = context.dataStore.edit { it[Keys.PRELOAD_NEXT_CHAPTER] = v }
+    suspend fun setPrefetchWifiPages(v: Int) = context.dataStore.edit { it[Keys.PREFETCH_WIFI] = v.coerceIn(0, 3) }
+    suspend fun setPrefetchMobilePages(v: Int) = context.dataStore.edit { it[Keys.PREFETCH_MOBILE] = v.coerceIn(0, 3) }
+    suspend fun setPrefetchDisableLowBattery(v: Boolean) = context.dataStore.edit { it[Keys.PREFETCH_LOW_BATTERY] = v }
+    suspend fun setDownloadWifiOnly(v: Boolean) = context.dataStore.edit { it[Keys.DOWNLOAD_WIFI_ONLY] = v }
+    suspend fun setDownloadChargingOnly(v: Boolean) = context.dataStore.edit { it[Keys.DOWNLOAD_CHARGING_ONLY] = v }
+    suspend fun setUiAnimations(v: Boolean) = context.dataStore.edit { it[Keys.UI_ANIMATIONS] = v }
     suspend fun setRememberPageLevel(v: Boolean) = context.dataStore.edit { it[Keys.REMEMBER_PAGE_LEVEL] = v }
     suspend fun setReaderFontSize(v: Float) = context.dataStore.edit { it[Keys.READER_FONT_SIZE] = v.coerceIn(10f, 24f) }
     suspend fun setReaderLineSpacing(v: Float) = context.dataStore.edit { it[Keys.READER_LINE_SPACING] = v.coerceIn(1f, 2f) }

@@ -30,6 +30,7 @@ import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.FilterAlt
 import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.MenuBook
 import androidx.compose.material.icons.outlined.Palette
@@ -179,6 +180,12 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
     fun setAutoScroll(v: Boolean) = launchSafe { container.settingsStore.setAutoScroll(v) }
     fun setAutoScrollSpeed(v: Float) = launchSafe { container.settingsStore.setAutoScrollSpeed(v) }
     fun setPreloadNextChapter(v: Boolean) = launchSafe { container.settingsStore.setPreloadNextChapter(v) }
+    fun setPrefetchWifiPages(v: Int) = launchSafe { container.settingsStore.setPrefetchWifiPages(v) }
+    fun setPrefetchMobilePages(v: Int) = launchSafe { container.settingsStore.setPrefetchMobilePages(v) }
+    fun setPrefetchDisableLowBattery(v: Boolean) = launchSafe { container.settingsStore.setPrefetchDisableLowBattery(v) }
+    fun setDownloadWifiOnly(v: Boolean) = launchSafe { container.settingsStore.setDownloadWifiOnly(v) }
+    fun setDownloadChargingOnly(v: Boolean) = launchSafe { container.settingsStore.setDownloadChargingOnly(v) }
+    fun setUiAnimations(v: Boolean) = launchSafe { container.settingsStore.setUiAnimations(v) }
     fun setRememberPageLevel(v: Boolean) = launchSafe { container.settingsStore.setRememberPageLevel(v) }
     fun setReaderFontSize(v: Float) = launchSafe { container.settingsStore.setReaderFontSize(v) }
     fun setReaderLineSpacing(v: Float) = launchSafe { container.settingsStore.setReaderLineSpacing(v) }
@@ -519,6 +526,8 @@ fun SettingsScreen(
     val snackbar = remember { SnackbarHostState() }
     // 关于页查看免责声明：点击按钮显示，无倒计时强制（用户已同意过）
     var showDisclaimer by remember { mutableStateOf(false) }
+    var showRuleTester by remember { mutableStateOf(false) }
+    var showDiagnostics by remember { mutableStateOf(false) }
 
     // v27.5 性能优化：settings 一定非 null（cachedSnapshot 已作为初始值），
     // 之前 settingsLoaded 用于防止 settings==null 期间误操作，现已不需要。
@@ -549,6 +558,7 @@ fun SettingsScreen(
                             "network" -> "网络与下载"
                             "privacy" -> "账号与隐私"
                             "about" -> "关于"
+                            "backup" -> "备份与恢复"
                             else -> "设置"
                         }
                     )
@@ -565,6 +575,7 @@ fun SettingsScreen(
     ) { inner ->
         val scrollState = rememberScrollState()
         when (section) {
+            "backup" -> Column(Modifier.fillMaxSize().padding(inner).padding(16.dp)) { BackupTools(container) }
             "appearance" -> AppearanceSettingsScreen(
                 vm = vm,
                 settings = settings,
@@ -586,6 +597,7 @@ fun SettingsScreen(
                 blockedTags = blockedTags,
                 blockedNames = blockedNames,
                 blockedAuthors = blockedAuthors,
+                onTestRules = { showRuleTester = true },
                 settingsLoaded = settingsLoaded,
                 inner = inner,
                 scrollState = scrollState,
@@ -597,6 +609,7 @@ fun SettingsScreen(
                 savingAndChecking = savingAndChecking,
                 settingsLoaded = settingsLoaded,
                 onOpenDomains = onOpenDomains,
+                onDiagnose = { showDiagnostics = true },
                 inner = inner,
                 scrollState = scrollState,
             )
@@ -617,6 +630,9 @@ fun SettingsScreen(
             else -> SettingsEntryList(inner = inner, onOpen = { section = it })
         }
     }
+
+    if (showRuleTester) FilterRuleTester(container) { showRuleTester = false }
+    if (showDiagnostics) NetworkDiagnosticsDialog(container) { showDiagnostics = false }
 
     // 关于页查看免责声明：无倒计时，仅查看（用户首次启动时已同意过）
     if (showDisclaimer) {
@@ -683,6 +699,9 @@ private fun SettingsEntryList(
                 subtitle = "登录、应用锁、隐身模式、屏蔽截图",
                 onClick = { onOpen("privacy") },
             )
+        }
+        item {
+            EntryCard(Icons.Outlined.Folder, "备份与恢复", "数据导出、导入预览、合并与覆盖", { onOpen("backup") })
         }
         item {
             EntryCard(
@@ -1133,6 +1152,7 @@ private fun ReaderSettingsScreen(
                 style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.Medium,
             )
+            SwitchRow("轻量界面动画", "短淡入淡出与进度过渡；系统动画设置为关闭时跟随系统。", settings?.uiAnimations ?: true, { vm.setUiAnimations(it) }, settingsLoaded)
             SwitchRow(
                 title = "沉浸式全屏",
                 subtitle = "阅读时隐藏状态栏和系统导航栏；点击屏幕显示工具栏，退出阅读器后自动恢复。",
@@ -1341,6 +1361,9 @@ private fun ReaderSettingsScreen(
             title = "加载与进度",
             icon = Icons.Outlined.MenuBook,
         ) {
+            SliderRow("Wi-Fi 预取页数", "提前准备接下来的图片，0 表示关闭。", (settings?.prefetchWifiPages ?: 2).toFloat(), 0f..3f, { vm.setPrefetchWifiPages(it.toInt()) }, settingsLoaded, { "${it.toInt()} 页" })
+            SliderRow("移动网络预取页数", "较小的窗口节省流量和内存。", (settings?.prefetchMobilePages ?: 1).toFloat(), 0f..3f, { vm.setPrefetchMobilePages(it.toInt()) }, settingsLoaded, { "${it.toInt()} 页" })
+            SwitchRow("低电量停止预取", "未充电且电量不高于 15% 时停止后台预取。", settings?.prefetchDisableLowBattery ?: true, { vm.setPrefetchDisableLowBattery(it) }, settingsLoaded)
             SwitchRow(
                 title = "预加载下一章",
                 subtitle = "阅读当前章节时后台预取下一章图片，翻章不白屏。",
@@ -1374,6 +1397,7 @@ private fun DiscoverySettingsScreen(
     blockedTags: Set<String>,
     blockedNames: Set<String>,
     blockedAuthors: Set<String>,
+    onTestRules: () -> Unit,
     settingsLoaded: Boolean,
     inner: PaddingValues,
     scrollState: androidx.compose.foundation.ScrollState,
@@ -1448,6 +1472,7 @@ private fun DiscoverySettingsScreen(
             title = stringResource(R.string.settings_group_filter),
             icon = Icons.Outlined.FilterAlt,
         ) {
+            OutlinedButton(onClick = onTestRules) { Text("测试屏蔽规则") }
             // v27.14：屏蔽模式选择
             Text("屏蔽模式", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Medium)
             Text(
@@ -1523,6 +1548,7 @@ private fun NetworkSettingsScreen(
     savingAndChecking: Boolean,
     settingsLoaded: Boolean,
     onOpenDomains: () -> Unit,
+    onDiagnose: () -> Unit,
     inner: PaddingValues,
     scrollState: androidx.compose.foundation.ScrollState,
 ) {
@@ -1684,11 +1710,14 @@ private fun NetworkSettingsScreen(
             }
         }
 
+        OutlinedButton(onClick = onDiagnose, modifier = Modifier.fillMaxWidth()) { Text("网络诊断中心") }
         // ============= 下载 =============
         GroupedSection(
             title = "下载",
             icon = Icons.Outlined.Download,
         ) {
+            SwitchRow("仅 Wi-Fi 下载", "切换到移动网络后等待 Wi-Fi，恢复连接后自动继续。", settings?.downloadWifiOnly ?: false, { vm.setDownloadWifiOnly(it) }, settingsLoaded)
+            SwitchRow("仅充电时下载", "未充电时等待，已下载文件保留。", settings?.downloadChargingOnly ?: false, { vm.setDownloadChargingOnly(it) }, settingsLoaded)
             SliderRow(
                 title = "下载并发数",
                 subtitle = "同时下载的本子数。越大越快但易被限流；in-flight 任务用旧限制完成。",

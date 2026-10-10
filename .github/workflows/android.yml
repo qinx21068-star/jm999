@@ -44,7 +44,12 @@ jobs:
           yes | sdkmanager --licenses >/dev/null || true
 
       - name: Install Android SDK packages
-        run: yes | sdkmanager "platforms;android-36" "build-tools;36.0.0"
+        shell: bash
+        run: |
+          set +e
+          yes | sdkmanager "platforms;android-36" "build-tools;36.0.0"
+          SDK_INSTALL_STATUS=${PIPESTATUS[1]}
+          exit "$SDK_INSTALL_STATUS"
 
       - name: Configure Gradle memory
         shell: bash
@@ -60,6 +65,16 @@ jobs:
 
       - name: Run unit tests
         run: gradle --no-daemon :app:testDebugUnitTest --stacktrace
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports-${{ github.sha }}
+          path: |
+            app/build/reports/tests/
+            app/build/test-results/
+          if-no-files-found: ignore
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
@@ -84,7 +99,11 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-          cache: gradle
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: 8.10.2
 
       - name: Use preinstalled Android SDK
         shell: bash
@@ -97,7 +116,12 @@ jobs:
           yes | sdkmanager --licenses >/dev/null || true
 
       - name: Install Android SDK packages
-        run: yes | sdkmanager "platforms;android-36" "build-tools;36.0.0"
+        shell: bash
+        run: |
+          set +e
+          yes | sdkmanager "platforms;android-36" "build-tools;36.0.0"
+          SDK_INSTALL_STATUS=${PIPESTATUS[1]}
+          exit "$SDK_INSTALL_STATUS"
 
       - name: Restore release keystore when configured
         env:

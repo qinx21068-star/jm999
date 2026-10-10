@@ -28,6 +28,7 @@ android {
     compileSdk = 36
 
     defaultConfig {
+        manifestPlaceholders["appLabel"] = "一根葱"
         applicationId = "com.jmreader"
         minSdk = 24
         targetSdk = 36
@@ -66,6 +67,7 @@ android {
         debug {
             isMinifyEnabled = false
             applicationIdSuffix = ".debug"
+            manifestPlaceholders["appLabel"] = "一根葱（测试版）"
         }
         release {
             isMinifyEnabled = true
@@ -98,6 +100,8 @@ android {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.core.splashscreen)
     implementation(libs.androidx.lifecycle.runtime.ktx)

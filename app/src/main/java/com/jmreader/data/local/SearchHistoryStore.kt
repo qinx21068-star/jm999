@@ -50,6 +50,14 @@ class SearchHistoryStore(private val context: Context) {
         }
     }
 
+    suspend fun importTerms(terms: List<String>, merge: Boolean) {
+        context.searchHistoryStore.edit { prefs ->
+            val existing = if (merge) prefs[orderedKey]?.split('\n').orEmpty() else emptyList()
+            prefs[orderedKey] = (existing + terms).map { it.trim().replace('\n', ' ') }
+                .filter { it.isNotBlank() }.distinct().take(20).joinToString("\n")
+        }
+    }
+
     /** 清空历史。 */
     suspend fun clear() {
         context.searchHistoryStore.edit { prefs ->

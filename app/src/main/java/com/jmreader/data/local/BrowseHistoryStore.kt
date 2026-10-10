@@ -63,6 +63,7 @@ class BrowseHistoryStore(context: Context, moshi: Moshi, scope: CoroutineScope) 
 
     /** 记录一次浏览（去重，已存在的提到最前）。 */
     suspend fun upsert(comic: ComicBriefDto) = withContext(Dispatchers.IO) {
+        ensureLoaded()
         mutex.withLock {
             val list = _items.value.toMutableList()
             list.removeAll { it.comic.id == comic.id }
@@ -74,18 +75,31 @@ class BrowseHistoryStore(context: Context, moshi: Moshi, scope: CoroutineScope) 
     }
 
     suspend fun clear() = withContext(Dispatchers.IO) {
+        ensureLoaded()
         mutex.withLock {
+            persist(emptyList())
             _items.value = emptyList()
-            runCatching { file.delete() }
         }
     }
 
     suspend fun remove(id: String) = withContext(Dispatchers.IO) {
+        ensureLoaded()
         mutex.withLock {
             val list = _items.value.toMutableList()
             list.removeAll { it.comic.id == id }
-            _items.value = list
             persist(list)
+            _items.value = list
+        }
+    }
+
+    suspend fun importData(records: List<BrowseEntry>, merge: Boolean) = withContext(Dispatchers.IO) {
+        ensureLoaded()
+        mutex.withLock {
+            val next = ((if (merge) _items.value else emptyList()) + records)
+                .filter { it.comic.id.isNotBlank() }.sortedByDescending { it.updatedAt }
+                .distinctBy { it.comic.id }.take(200)
+            persist(next)
+            _items.value = next
         }
     }
 
@@ -97,6 +111,6 @@ class BrowseHistoryStore(context: Context, moshi: Moshi, scope: CoroutineScope) 
                 file.writeText(adapter.toJson(list))
                 tmp.delete()
             }
-        }
+        }.getOrThrow()
     }
 }

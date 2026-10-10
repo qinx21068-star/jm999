@@ -223,7 +223,7 @@ class DomainViewModel(private val container: AppContainer) : ViewModel() {
             reload()
             _events.emit("已从服务器拉取最新域名并合并")
         } else {
-            _events.emit("拉取失败（字节CDN不可达），请手动添加域名或检查网络")
+            _events.emit("本次未更新域名（可能正在节流或网络不可达），请稍后重试")
         }
     }
 }

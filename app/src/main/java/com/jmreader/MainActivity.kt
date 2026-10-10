@@ -49,7 +49,8 @@ class MainActivity : FragmentActivity() {
      * - 之后每次 App 从后台回到前台（ON_STOP→ON_START），若启用应用锁则置 true
      * - 用户验证通过后置 false
      */
-    @Volatile private var locked = false
+    // Compose State：ProcessLifecycleObserver 在后台切换时更新后，锁屏层必须立即重组。
+    private var locked by androidx.compose.runtime.mutableStateOf(false)
 
     /** v27.5 #28：是否启用应用锁（缓存到字段避免每次访问都读 flow）。 */
     @Volatile private var appLockEnabled = false
@@ -415,6 +416,7 @@ class MainActivity : FragmentActivity() {
      * - 不在阅读器或未开启 → bridge.callback == null → 不消费，系统正常调音量
      */
     override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent?): Boolean {
+        if (locked) return super.onKeyDown(keyCode, event)
         when (keyCode) {
             android.view.KeyEvent.KEYCODE_VOLUME_UP -> {
                 if (com.jmreader.ui.screen.reader.ReaderVolumeKeyBridge.handleVolumeKey(isUp = true)) {

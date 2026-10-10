@@ -161,6 +161,12 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
      */
     private fun currentDataSource(): List<ComicBriefDto> = mergeEnriched(rawItems)
 
+    private fun hasPendingEnrichment(items: List<ComicBriefDto>): Boolean =
+        hasTagRules && items.any { comic ->
+            comic.id.isNotBlank() && comic.id !in enrichedIds &&
+                (enrichAttempts[comic.id] ?: 0) < MAX_ENRICH_ATTEMPTS
+        }
+
     /**
      * 用当前数据源 + 当前规则重新计算可见列表并写入 _state。
      * 必须在 [Dispatchers.Default] 上调用（applyBlock 内有大量繁简转换）。
@@ -170,7 +176,7 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
         val rules = container.blockedTagsStore.normalizeRules(tags, names, authors)
         val snapshot = currentDataSource()
         val (filtered, coverHidden) = applyBlock(snapshot, rules, blockMode)
-        val stillPending = hasTagRules && snapshot.any { it.id !in enrichedIds }
+        val stillPending = hasPendingEnrichment(snapshot)
         // _state.value 是线程安全的，可在任意线程写
         if (filtered != _state.value.items || stillPending != _state.value.filtering ||
             coverHidden != _state.value.coverHiddenIds
@@ -205,7 +211,7 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
                         withContext(Dispatchers.Default) {
                             val src = currentDataSource()
                             val (filtered, coverHidden) = applyBlock(src, rules, blockMode)
-                            val stillPending = hasTagRules && src.any { it.id !in enrichedIds }
+                            val stillPending = hasPendingEnrichment(src)
                             if (filtered != _state.value.items || stillPending != _state.value.filtering ||
                                 coverHidden != _state.value.coverHiddenIds
                             ) {
@@ -281,7 +287,7 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
         val newIds = items.mapTo(HashSet(items.size)) { it.id }
         enrichedIds.retainAll(newIds)
         enrichedDetailCache.keys.retainAll(newIds)
-        enrichAttempts.keys.retainAll(newIds)
+        enrichAttempts.clear()
         items.forEach { c ->
             if (c.id.isNotEmpty() && c.tags.isNotEmpty()) {
                 enrichedIds.add(c.id)
@@ -355,7 +361,7 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
                         val newIds = items.mapTo(HashSet(items.size)) { it.id }
                         enrichedIds.retainAll(newIds)
                         enrichedDetailCache.keys.retainAll(newIds)
-                        enrichAttempts.keys.retainAll(newIds)
+                        enrichAttempts.clear()
                         val reached = items.isEmpty() || (total != null && rawItems.size >= total)
                         val (tags, names, authors) = currentRules()
                         val rules = container.blockedTagsStore.normalizeRules(tags, names, authors)
@@ -371,7 +377,7 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
                             total = total,
                             refreshing = false,
                             endReached = reached,
-                            filtering = hasTagRules && rawItems.any { it.id !in enrichedIds },
+                            filtering = hasPendingEnrichment(rawItems),
                             coverHiddenIds = coverHidden,
                         )
                         enrichTagsInBackground()
@@ -447,7 +453,7 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
                             total = total ?: _state.value.total,
                             loadingMore = false,
                             endReached = reached,
-                            filtering = hasTagRules && rawItems.any { it.id !in enrichedIds },
+                            filtering = hasPendingEnrichment(rawItems),
                             coverHiddenIds = coverHidden,
                         )
                         enrichTagsInBackground()
@@ -587,7 +593,10 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
         enrichJob?.cancel()
         enrichJob = viewModelScope.launch(Dispatchers.Default) {
             try {
-                val toEnrich = rawItems.filter { it.id.isNotEmpty() && it.id !in enrichedIds }
+                val toEnrich = rawItems.filter {
+                    it.id.isNotEmpty() && it.id !in enrichedIds &&
+                        (enrichAttempts[it.id] ?: 0) < MAX_ENRICH_ATTEMPTS
+                }
                 if (toEnrich.isEmpty()) {
                     if (_state.value.filtering) _state.value = _state.value.copy(filtering = false)
                     return@launch
@@ -658,7 +667,7 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
                                     } else {
                                         val src = currentDataSource()
                                         val (filtered, coverHidden) = applyBlock(src, rules, blockMode)
-                                        val stillPending = hasTagRules && src.any { it.id !in enrichedIds }
+                                        val stillPending = hasPendingEnrichment(src)
                                         if (filtered != _state.value.items ||
                                             stillPending != _state.value.filtering ||
                                             coverHidden != _state.value.coverHiddenIds
@@ -682,7 +691,7 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
                 } else {
                     val src = currentDataSource()
                     val (filtered, coverHidden) = applyBlock(src, rules, blockMode)
-                    val stillPending = hasTagRules && src.any { it.id !in enrichedIds }
+                    val stillPending = hasPendingEnrichment(src)
                     if (filtered != _state.value.items ||
                         stillPending != _state.value.filtering ||
                         coverHidden != _state.value.coverHiddenIds

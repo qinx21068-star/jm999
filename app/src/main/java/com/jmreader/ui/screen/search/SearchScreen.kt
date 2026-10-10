@@ -171,6 +171,11 @@ class SearchViewModel(container: AppContainer) : BaseListViewModel(container) {
         }
     }
 
+    fun applyTemplate(template: com.jmreader.data.local.SearchTemplate) {
+        order = template.order.takeIf { it in setOf("latest", "views", "likes", "picture") } ?: "latest"
+        searchDirect(template.query)
+    }
+
     fun onOrderChange(o: String) {
         // v27.14：批量模式下排序无意义（结果固定无分页），直接忽略
         if (batchMode) return
@@ -396,7 +401,11 @@ fun SearchScreen(
     val onLoadMore = remember(vm) { { vm.loadMore() } }
 
     // v27.5 #11 标签筛选：从当前搜索结果提取热门 tag，点击 chip 二次过滤
-    var selectedTag by remember(vm.query) { mutableStateOf<String?>(null) }
+    var selectedTag by remember(vm.query, vm.order) { mutableStateOf<String?>(null) }
+    var pendingTemplateTag by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(vm.query, vm.order, pendingTemplateTag) {
+        if (pendingTemplateTag != null) { selectedTag = pendingTemplateTag; pendingTemplateTag = null }
+    }
     val availableTags = remember(state.items) {
         state.items.flatMap { it.tags }
             .groupingBy { it }
@@ -550,6 +559,10 @@ fun SearchScreen(
         // v27.6：历史/热门/排序chips/tag chips 作为 ComicList 的 header，随列表滚动移出视野
         // 搜索框保持固定（用户需要随时看到搜索框）
         val searchHeader: @androidx.compose.runtime.Composable () -> Unit = {
+            SearchTemplatePanel(container, vm.query, vm.order, selectedTag) { template ->
+                vm.applyTemplate(template)
+                pendingTemplateTag = template.tag
+            }
             // 搜索历史：输入框为空且开启"记录搜索历史"时显示
             if (vm.query.isBlank() && saveHistoryEnabled && history.isNotEmpty()) {
                 Row(

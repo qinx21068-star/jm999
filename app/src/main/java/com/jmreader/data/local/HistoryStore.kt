@@ -47,7 +47,7 @@ class HistoryStore(context: Context, moshi: Moshi, scope: CoroutineScope) {
                 val loadedList = runCatching {
                     file.takeIf { it.exists() }?.readText()?.let { adapter.fromJson(it) } ?: emptyList()
                 }.getOrDefault(emptyList())
-                _items.value = loadedList
+                _items.value = loadedList.sortedByDescending { it.updatedAt }
             }
             loaded.complete(Unit)
         }
@@ -58,6 +58,7 @@ class HistoryStore(context: Context, moshi: Moshi, scope: CoroutineScope) {
 
     suspend fun upsert(comic: ComicBriefDto, chapterId: String, chapterTitle: String, page: Int) =
         withContext(Dispatchers.IO) {
+            ensureLoaded()
             mutex.withLock {
                 val list = _items.value.toMutableList()
                 // 关键修复（Bug 34）：之前 removeAll { it.comic.id == comic.id } 会删除该漫画所有章节历史，
@@ -67,30 +68,54 @@ class HistoryStore(context: Context, moshi: Moshi, scope: CoroutineScope) {
                 // 现在只删除同漫画同章节的旧记录，保留其他章节进度。
                 list.removeAll { it.comic.id == comic.id && it.chapterId == chapterId }
                 list.add(0, HistoryEntry(comic, chapterId, chapterTitle, page, System.currentTimeMillis()))
-                // 每漫画最多保留 20 条章节进度，避免单本漫画章节过多挤占其他漫画的历史空间。
-                // 整体上限 200 条保持不变。
-                val byComic = list.groupBy { it.comic.id }
-                    .mapValues { (_, v) -> v.take(20) }
-                    .values.flatten()
-                val trimmed = byComic.take(200)
-                _items.value = trimmed
+                // 先按全局更新时间排序，再限制每本漫画最多 20 条。
+                // 旧实现先 groupBy 再 flatten，更新较新的条目可能被旧漫画分组顺序遮住，
+                // 导致首页/详情页拿到的"最近阅读"不是实际最近的一条。
+                val perComicCount = HashMap<String, Int>()
+                val trimmed = list
+                    .sortedByDescending { it.updatedAt }
+                    .filter { entry ->
+                        val count = perComicCount[entry.comic.id] ?: 0
+                        if (count >= 20) false else {
+                            perComicCount[entry.comic.id] = count + 1
+                            true
+                        }
+                    }
+                    .take(200)
                 persist(trimmed)
+                _items.value = trimmed
             }
         }
 
     suspend fun clear() = withContext(Dispatchers.IO) {
+        ensureLoaded()
         mutex.withLock {
+            persist(emptyList())
             _items.value = emptyList()
-            runCatching { file.delete() }
         }
     }
 
-    /** 删除单条（用户在历史列表里清掉某条用）。 */
-    suspend fun remove(id: String) = withContext(Dispatchers.IO) {
+    /** 删除一条章节进度；不误删同一本漫画其它章节的记录。 */
+    suspend fun remove(comicId: String, chapterId: String? = null) = withContext(Dispatchers.IO) {
+        ensureLoaded()
         mutex.withLock {
-            val list = _items.value.filterNot { it.comic.id == id }
-            _items.value = list
+            val list = _items.value.filterNot {
+                it.comic.id == comicId && (chapterId == null || it.chapterId == chapterId)
+            }
             persist(list)
+            _items.value = list
+        }
+    }
+
+    suspend fun importData(records: List<HistoryEntry>, merge: Boolean) = withContext(Dispatchers.IO) {
+        ensureLoaded()
+        mutex.withLock {
+            val next = ((if (merge) _items.value else emptyList()) + records)
+                .filter { it.comic.id.isNotBlank() && it.chapterId.isNotBlank() && it.page >= 0 }
+                .sortedByDescending { it.updatedAt }
+                .distinctBy { it.comic.id to it.chapterId }.take(200)
+            persist(next)
+            _items.value = next
         }
     }
 
@@ -103,6 +128,6 @@ class HistoryStore(context: Context, moshi: Moshi, scope: CoroutineScope) {
                 file.writeText(adapter.toJson(list))
                 tmp.delete()
             }
-        }
+        }.getOrThrow()
     }
 }

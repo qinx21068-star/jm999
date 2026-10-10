@@ -2,6 +2,12 @@ package com.jmreader.data.download
 
 import android.content.Context
 import android.net.Uri
+import android.util.AtomicFile
+import com.squareup.moshi.JsonClass
+import com.jmreader.data.api.direct.executeCancellable
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.ensureActive
+import kotlin.coroutines.coroutineContext
 import androidx.documentfile.provider.DocumentFile
 import com.jmreader.data.AppContainer
 import com.jmreader.data.dto.ComicBriefDto
@@ -9,11 +15,14 @@ import com.jmreader.data.dto.ComicDetailDto
 import com.jmreader.data.repository.Resource
 import com.jmreader.data.repository.proxiedImageUrl
 import com.jmreader.core.CrashHandler
+import com.jmreader.data.api.NetworkFactory
+import com.squareup.moshi.Types
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -21,7 +30,9 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.plus
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -29,7 +40,19 @@ import okhttp3.Request
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
-enum class DownloadStatus { QUEUED, DOWNLOADING, COMPLETED, FAILED }
+enum class DownloadStatus { QUEUED, DOWNLOADING, WAITING, PAUSED, COMPLETED, FAILED }
+
+@JsonClass(generateAdapter = false)
+internal data class PersistedDownload(
+    val comic: ComicBriefDto,
+    val detail: ComicDetailDto,
+    val status: DownloadStatus,
+    val progress: Int,
+    val totalChapters: Int,
+    val doneChapters: Int,
+    val failedImages: Int,
+    val skippedChapterIds: Set<String> = emptySet(),
+)
 
 data class DownloadTask(
     val comic: ComicBriefDto,
@@ -39,6 +62,12 @@ data class DownloadTask(
     val doneChapters: Int,
     /** 失败的图片数（单图下载失败累计）。0=全部成功。 */
     val failedImages: Int = 0,
+    val currentChapterId: String? = null,
+    val currentChapterTitle: String? = null,
+    val bytesPerSecond: Long = 0,
+    val etaSeconds: Long? = null,
+    val waitingReason: String? = null,
+    val skippedChapterIds: Set<String> = emptySet(),
 )
 
 /**
@@ -124,8 +153,23 @@ class DownloadManager(
     private val _tasks = MutableStateFlow<List<DownloadTask>>(emptyList())
     val tasks: StateFlow<List<DownloadTask>> = _tasks.asStateFlow()
 
+    private val taskFile = File(context.filesDir, "download_tasks.json")
+    private val taskType = Types.newParameterizedType(List::class.java, PersistedDownload::class.java)
+    private val taskAdapter = NetworkFactory.moshi.adapter<List<PersistedDownload>>(taskType)
+    private var persistJob: Job? = null
+    private val persistMutex = Mutex()
+    private val loaded = CompletableDeferred<Unit>()
+    private val skippedChapters = ConcurrentHashMap<String, Set<String>>()
+    private val removals = mutableMapOf<String, Job>()
+    private val touchedIds = ConcurrentHashMap.newKeySet<String>()
+    private var restoring = false
+    private val restoreMutex = Mutex()
+
     /** 每本漫画的下载 Job，remove 时 cancel。key=comicId。 */
     private val jobs = mutableMapOf<String, Job>()
+    /** Generation token prevents an old cancelled job from updating a newly re-enqueued task. */
+    private val runTokens = ConcurrentHashMap<String, String>()
+    private val pausedIds = ConcurrentHashMap.newKeySet<String>()
 
     /**
      * 缓存每本漫画的详情，供 [retry] 在 DownloadsScreen 直接重试使用，
@@ -133,6 +177,55 @@ class DownloadManager(
      * key=comicId，value=enqueue 时传入的 ComicDetailDto。
      */
     private val detailCache = ConcurrentHashMap<String, ComicDetailDto>()
+
+    init {
+        scope.launch {
+            try { loadPersistedTasks() } finally { loaded.complete(Unit) }
+        }
+    }
+
+    private suspend fun loadPersistedTasks() = withContext(Dispatchers.IO) {
+        val records = runCatching {
+            if (!taskFile.exists() && !File(taskFile.path + ".bak").exists()) emptyList() else AtomicFile(taskFile).openRead().bufferedReader().use { taskAdapter.fromJson(it.readText()).orEmpty() }
+        }.getOrElse {
+            com.jmreader.core.Logger.w("Download", "读取下载任务索引失败", it)
+            emptyList()
+        }
+        val restored = records.map { record ->
+            val status = if (record.status == DownloadStatus.DOWNLOADING || record.status == DownloadStatus.QUEUED || record.status == DownloadStatus.WAITING) {
+                DownloadStatus.PAUSED
+            } else record.status
+            if (record.comic.id !in touchedIds) { detailCache.putIfAbsent(record.comic.id, record.detail); skippedChapters[record.comic.id] = record.skippedChapterIds }
+            DownloadTask(
+                comic = record.comic,
+                status = status,
+                progress = record.progress.coerceIn(0, 100),
+                totalChapters = record.totalChapters,
+                doneChapters = record.doneChapters,
+                failedImages = record.failedImages, skippedChapterIds = record.skippedChapterIds,
+            )
+        }.filter { it.comic.id.matches(Regex("[A-Za-z0-9_-]{1,128}")) }.distinctBy { it.comic.id }.filterNot { it.comic.id in touchedIds }
+        synchronized(jobs) {
+            val eligible = restored.filterNot { it.comic.id in touchedIds }
+            _tasks.update { current -> current + eligible.filterNot { task -> current.any { it.comic.id == task.comic.id } } }
+        }
+    }
+
+    /** Persist a debounced snapshot; atomic rename prevents half-written task indexes. */
+    private fun schedulePersist() {
+        persistJob?.cancel()
+        persistJob = scope.launch {
+            loaded.await()
+            delay(250L)
+            persistMutex.withLock {
+                withContext(Dispatchers.IO) {
+                    runCatching { writeIndex() }.onFailure { e ->
+                        com.jmreader.core.Logger.w("Download", "写下载任务索引失败", e)
+                    }
+                }
+            }
+        }
+    }
 
     private fun rootDir() = File(context.filesDir, "downloads").apply { if (!exists()) mkdirs() }
 
@@ -154,13 +247,15 @@ class DownloadManager(
         runCatching { DocumentFile.fromTreeUri(context, it) }.getOrNull()
     }
 
-    /** 获取/创建 SAF 下的漫画目录。 */
+    /** 获取/创建 SAF 下的漫画目录（仅写路径使用）。 */
     private fun safComicDir(comicId: String): DocumentFile? {
         val root = safRootDoc() ?: return null
-        return runCatching {
-            root.findFile(comicId) ?: root.createDirectory(comicId)
-        }.getOrNull()
+        return runCatching { root.findFile(comicId) ?: root.createDirectory(comicId) }.getOrNull()
     }
+
+    /** 读取已有 SAF 漫画目录；读路径不创建空目录。 */
+    private fun existingSafComicDir(comicId: String): DocumentFile? =
+        runCatching { safRootDoc()?.findFile(comicId) }.getOrNull()
 
     /**
      * v27.6：把内部存储中已下载的漫画复制到 SAF 目录。
@@ -185,7 +280,7 @@ class DownloadManager(
                 val chapterId = parts[0]
                 val fileName = parts[1]
                 // 跳过临时文件
-                if (fileName.endsWith(".tmp")) return@forEach
+                if (fileName.contains(".tmp")) return@forEach
                 // 确保章节目录存在
                 val chapterDoc = dstComicDir.findFile(chapterId) ?: dstComicDir.createDirectory(chapterId)
                 if (chapterDoc == null) return@forEach
@@ -197,6 +292,20 @@ class DownloadManager(
                 context.contentResolver.openOutputStream(dstFile.uri)?.use { os ->
                     srcFile.inputStream().use { it.copyTo(os) }
                 }
+            }
+            val exportComplete = srcComicDir.listFiles()
+                ?.filter { it.isDirectory }
+                ?.all { srcChapter ->
+                    val expectedImages = imageFilesOnly(srcChapter).size
+                    val dstChapter = dstComicDir.findFile(srcChapter.name)
+                    val copiedImages = dstChapter?.listFiles()
+                        ?.count { it.isFile && it.name?.let { n -> !n.startsWith(".") && !n.contains(".tmp") } ?: false }
+                    dstChapter != null && copiedImages == expectedImages
+                } == true
+            if (!exportComplete) error("SAF 导出校验失败：存在未完成章节")
+            dstComicDir.findFile(".complete")?.delete()
+            dstComicDir.createFile("text/plain", ".complete")?.let { marker ->
+                context.contentResolver.openOutputStream(marker.uri)?.use { it.write("complete".toByteArray()) }
             }
             com.jmreader.core.Logger.i("Download", "SAF 导出完成: $comicId")
         }.onFailure { e ->
@@ -210,13 +319,21 @@ class DownloadManager(
      * 返回 content:// URI 字符串列表，按文件名排序。
      */
     private fun listSafImages(comicId: String, chapterId: String): List<String> {
-        val comicDir = safComicDir(comicId) ?: return emptyList()
+        val comicDir = existingSafComicDir(comicId) ?: return emptyList()
         val chapterDir = runCatching { comicDir.findFile(chapterId) }.getOrNull() ?: return emptyList()
+        val completeMarker = comicDir.findFile(".complete") != null
+        val expected = chapterDir.findFile(".expected")?.let { marker ->
+            runCatching {
+                context.contentResolver.openInputStream(marker.uri)?.bufferedReader()?.use { it.readText().trim().toInt() }
+            }.getOrNull()
+        }
+        if (!completeMarker && expected == null) return emptyList()
         return runCatching {
-            chapterDir.listFiles()
-                .filter { it.isFile && it.name?.let { n -> !n.startsWith(".") && !n.endsWith(".tmp") } ?: false }
+            val files = chapterDir.listFiles()
+                .filter { it.isFile && it.name?.let { n -> !n.startsWith(".") && !n.contains(".tmp") } ?: false }
                 .sortedBy { it.name ?: "" }
-                .map { it.uri.toString() }
+            if (expected != null && files.size != expected) emptyList()
+            else files.map { it.uri.toString() }
         }.getOrDefault(emptyList())
     }
 
@@ -224,7 +341,7 @@ class DownloadManager(
     private fun removeSaf(comicId: String) {
         if (!isSafEnabled) return
         runCatching {
-            safComicDir(comicId)?.delete()
+            existingSafComicDir(comicId)?.delete()
         }
     }
 
@@ -251,7 +368,7 @@ class DownloadManager(
      */
     private fun imageFilesOnly(dir: File): List<File> =
         dir.listFiles { f ->
-            f.isFile && !f.name.startsWith(".") && !f.name.endsWith(".tmp")
+            f.isFile && !f.name.startsWith(".") && !f.name.contains(".tmp")
         }?.toList() ?: emptyList()
 
     /**
@@ -285,7 +402,7 @@ class DownloadManager(
                             }
                         }
                         // v27.13：清理进程被杀时残留的 .tmp 文件
-                        chDir.listFiles { f -> f.name.endsWith(".tmp") }?.forEach { it.delete() }
+                        chDir.listFiles { f -> f.name.contains(".tmp") && runTokens[comicDir.name]?.let { token -> !f.name.endsWith(".tmp.$token") } != false }?.forEach { it.delete() }
                     }
                 }
             }
@@ -301,8 +418,8 @@ class DownloadManager(
         val files = imageFilesOnly(dir)
         if (files.isEmpty()) return false
         // 优先用记录的预期数校验；无记录时（旧版本下载的）只看非空，保持兼容
-        val expected = expectedCounts["$comicId/$chapterId"]
-        return expected == null || files.size >= expected
+        val expected = expectedCounts["$comicId/$chapterId"] ?: File(dir, ".expected").takeIf { it.exists() }?.let { runCatching { it.readText().trim().toIntOrNull() }.getOrNull() }
+        return expected == null || files.size == expected
     }
 
     /**
@@ -322,13 +439,12 @@ class DownloadManager(
         withContext(Dispatchers.IO) {
             val dir = chapterDirForRead(comicId, chapterId)
             val files = imageFilesOnly(dir)
-            val expected = expectedCounts["$comicId/$chapterId"]
+            val expected = expectedCounts["$comicId/$chapterId"] ?: File(dir, ".expected").takeIf { it.exists() }?.let { runCatching { it.readText().trim().toIntOrNull() }.getOrNull() }
             // 仅在文件数齐全时返回，避免半成品目录被阅读器渲染成"只有几页的章节"
-            if (expected != null && files.size < expected) {
+            if (expected != null && files.size != expected) {
                 // v27.6：内部存储无完整文件，尝试从 SAF 读（App 数据被清后仍可读）
                 val safFiles = listSafImages(comicId, chapterId)
                 if (safFiles.isNotEmpty()) {
-                    // SAF 无 expectedCounts 校验，只要非空即返回
                     return@withContext safFiles
                 }
                 return@withContext emptyList()
@@ -350,43 +466,50 @@ class DownloadManager(
      *   然后追加新任务。这允许用户「重新下载」已失败/已完成的本子。
      * - 同步取消旧任务的协程（如有）。
      */
-    fun enqueue(comic: ComicBriefDto, detail: ComicDetailDto) {
-        // 原子检查 + 去重：已有排队/下载中任务则不重复
-        val alreadyQueued = _tasks.value.any {
-            it.comic.id == comic.id &&
-                (it.status == DownloadStatus.QUEUED || it.status == DownloadStatus.DOWNLOADING)
-        }
-        if (alreadyQueued) return
-
-        // 原子更新：移除旧任务 + 追加新任务，用 CAS 循环避免并发覆盖
-        _tasks.update { list ->
-            val filtered = list.filterNot { it.comic.id == comic.id }
-            filtered + DownloadTask(comic, DownloadStatus.QUEUED, 0, detail.chapters.size, 0)
-        }
-        // 取消旧协程（若有）
-        synchronized(jobs) { jobs.remove(comic.id)?.cancel() }
-        // 缓存详情，供 retry 直接复用（DownloadsScreen 重试按钮无需重新拉详情）
-        detailCache[comic.id] = detail
-
-        // v27.5 稳定性加固（TOCTOU 修复）：原代码先 launch 再 synchronized put，存在竞态窗口——
-        // launch 已返回 Job 但 jobs[id]=job 还未执行时，remove 可能并发执行 jobs.remove(id)，
-        // 拿到的是 null（map 还没 put），cancel 不生效 → 协程继续运行无法取消。
-        // 改为 synchronized 块内 launch + put 原子完成（launch 不阻塞 monitor，立即返回 Job）。
+    fun enqueue(comic: ComicBriefDto, detail: ComicDetailDto, onlyChapterIds: Set<String>? = null) {
+        require(comic.id.matches(Regex("[A-Za-z0-9_-]{1,128}")) && detail.chapters.all { it.id.matches(Regex("[A-Za-z0-9_-]{1,128}")) }) { "漫画或章节 ID 无效" }
         synchronized(jobs) {
-            val job = scope.launch { runDownload(comic.id, detail) }
-            jobs[comic.id] = job
+            check(!restoring) { "正在恢复数据，稍后再加入下载" }
+            val current = _tasks.value.firstOrNull { it.comic.id == comic.id }
+            if (current?.status in setOf(DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.WAITING)) return
+            touchedIds.add(comic.id)
+            val previous = jobs[comic.id]
+            previous?.cancel()
+            val deletion = removals[comic.id]
+            val token = java.util.UUID.randomUUID().toString()
+            runTokens[comic.id] = token
+            pausedIds.remove(comic.id)
+            detailCache[comic.id] = detail
+            val task = DownloadTask(comic, DownloadStatus.QUEUED, current?.progress ?: 0,
+                detail.chapters.size, current?.doneChapters ?: 0,
+                skippedChapterIds = skippedChapters[comic.id].orEmpty())
+            _tasks.update { list -> list.filterNot { it.comic.id == comic.id } + task }
+            jobs[comic.id] = scope.launch {
+                loaded.await()
+                previous?.join()
+                deletion?.join()
+                if (runTokens[comic.id] == token) runDownload(comic.id, detail, token, onlyChapterIds)
+            }
+            schedulePersist()
         }
     }
 
-    private suspend fun runDownload(comicId: String, detail: ComicDetailDto) {
+    private suspend fun runDownload(comicId: String, detail: ComicDetailDto, runToken: String, onlyChapterIds: Set<String>? = null) {
         // v27.5：捕获当前 Semaphore 到局部变量，整个下载过程使用同一个 Semaphore，
         // 避免 setConcurrency 切换 Semaphore 时 in-flight 任务行为不一致。
         val limiter = concurrencyLimit
         // 限制并发：最多 N 本同时下载（N 由设置控制，默认 2）
         limiter.withPermit {
             try {
-                runDownloadInner(comicId, detail)
+                awaitConditions(comicId, runToken)
+                runDownloadInner(comicId, detail, runToken, onlyChapterIds)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                updateIfCurrent(comicId, runToken) { it.copy(status = DownloadStatus.FAILED, waitingReason = e.message, bytesPerSecond = 0, etaSeconds = null) }
+                com.jmreader.core.Logger.w("Download", "下载任务失败", e)
             } finally {
+                if (runTokens[comicId] == runToken) runTokens.remove(comicId, runToken)
                 // v27.5 稳定性加固（medium 修复）：协程被 cancel 时，下载中的 .tmp 文件
                 // 可能残留（downloadFile/downloadAndDecode 是阻塞 I/O，cancel 只能在下一挂起点抛出）。
                 // 这里清理整个漫画目录下的 .tmp 文件，避免累积占存储。
@@ -394,17 +517,18 @@ class DownloadManager(
                 runCatching {
                     val dir = File(rootDir(), comicId)
                     dir.walkTopDown()
-                        .filter { it.isFile && it.name.endsWith(".tmp") }
+                        .filter { it.isFile && it.name.endsWith(".tmp.$runToken") }
                         .forEach { it.delete() }
                 }
             }
         }
     }
 
-    private suspend fun runDownloadInner(comicId: String, detail: ComicDetailDto) {
+    private suspend fun runDownloadInner(comicId: String, detail: ComicDetailDto, runToken: String, onlyChapterIds: Set<String>? = null) {
         // v27.5：拆出 inner 让 runDownload 可以在 finally 中统一清理 .tmp 文件。
         // 原实现保留在 inner 中，调用方语义不变。
         // 任务已不在列表（被 remove 了）；协程取消由后续 isActive() 检查处理。
+        if (runTokens[comicId] != runToken) return
         // 关键修复（Bug 16）：移除 Thread.currentThread().isInterrupted 检查——
         // Kotlin 协程 cancel() 不会设置 Thread.isInterrupted（除非用 runInterruptible），
         // 该检查永远 false，纯属无效代码，给读者造成"已处理取消"的错觉。
@@ -416,7 +540,7 @@ class DownloadManager(
 
         // 空章节：标 FAILED 而非假成功
         if (chapters.isEmpty()) {
-            update(comicId) { it.copy(status = DownloadStatus.FAILED, progress = 0) }
+            updateIfCurrent(comicId, runToken) { it.copy(status = DownloadStatus.FAILED, progress = 0) }
             com.jmreader.core.Logger.w("Download", "下载失败：$comicId 无章节")
             return
         }
@@ -424,17 +548,22 @@ class DownloadManager(
         // 关键修复（Bug 17）：retry 时扫描已完整下载的章节作为初始 done，
         // 避免 UI 显示 "0/N 已完成" 误导用户以为从头重下。
         // 已完整下载的章节会在下面的 for 循环中跳过：不重复请求章节接口、不重复下图片。
-        var done = chapters.count { isChapterDownloaded(comicId, it.id) }
+        var done = chapters.count { it.id !in skippedChapters[comicId].orEmpty() && isChapterDownloaded(comicId, it.id) }
         var totalFailedImages = 0
         var totalImages = 0
+        var downloadedBytes = 0L
+        val rateStart = android.os.SystemClock.elapsedRealtime()
 
         for (ch in chapters) {
             // 协程取消（remove 触发）时立即停止
-            if (!isActive()) return
+            if (!isActive() || comicId in pausedIds) return
+            if (ch.id in skippedChapters[comicId].orEmpty() || (onlyChapterIds != null && ch.id !in onlyChapterIds)) continue
+            awaitConditions(comicId, runToken)
+            updateIfCurrent(comicId, runToken) { it.copy(currentChapterId = ch.id, currentChapterTitle = ch.title) }
             // 已完整下载的章节跳过（retry 场景）。
             // 注意：不能在这里 done++，已在初始 done 中计入。
             if (isChapterDownloaded(comicId, ch.id)) {
-                update(comicId) {
+                updateIfCurrent(comicId, runToken) {
                     it.copy(
                         status = DownloadStatus.DOWNLOADING,
                         doneChapters = done,
@@ -443,7 +572,7 @@ class DownloadManager(
                 }
                 continue
             }
-            update(comicId) { it.copy(status = DownloadStatus.DOWNLOADING, doneChapters = done) }
+            updateIfCurrent(comicId, runToken) { it.copy(status = DownloadStatus.DOWNLOADING, doneChapters = done) }
             // 关键修复（Bug 18）：章节图片接口加 3 次指数退避重试（500ms, 1000ms）。
             // 之前单次网络抖动/限流 5xx 直接整本标 FAILED，下到第 9 章只因章节接口一次失败全功尽弃。
             // v27.5 稳定性加固（high 修复）：直连模式下 JMRepository.chapterImages 内部用 runCatching
@@ -451,7 +580,7 @@ class DownloadManager(
             // 现在改为：try-catch + res is Resource.Success 双重判断，任一失败都走重试。
             var res: com.jmreader.data.repository.Resource<com.jmreader.data.dto.ChapterImagesDto>? = null
             for (attempt in 0 until 3) {
-                if (!isActive()) return
+                if (!isActive() || comicId in pausedIds) return
                 try {
                     res = container.repository.chapterImages(ch.id)
                     if (res is Resource.Success) break
@@ -471,7 +600,7 @@ class DownloadManager(
             }
             if (res == null || res !is Resource.Success) {
                 com.jmreader.core.Logger.w("Download", "章节图片接口 3 次重试均失败 ${ch.id}")
-                update(comicId) { it.copy(status = DownloadStatus.FAILED) }
+                updateIfCurrent(comicId, runToken) { it.copy(status = DownloadStatus.FAILED) }
                 return
             }
             when (res) {
@@ -483,7 +612,7 @@ class DownloadManager(
                     if (images.isEmpty()) {
                         com.jmreader.core.Logger.w("Download", "章节 ${ch.id} 无图片")
                         done++
-                        update(comicId) {
+                        updateIfCurrent(comicId, runToken) {
                             it.copy(
                                 doneChapters = done,
                                 progress = (done * 100 / chapters.size.coerceAtLeast(1)),
@@ -524,13 +653,15 @@ class DownloadManager(
                     // 10 章 × 40 张 = 400 次 emit，每次都触发 DownloadsScreen LazyColumn 重新 diff。
                     var lastEmitPct = -1
                     images.forEachIndexed { index, raw ->
-                        if (!isActive()) return
+                        if (!isActive() || comicId in pausedIds) return
+                        awaitConditions(comicId, runToken)
+                        if (ch.id in skippedChapters[comicId].orEmpty()) return@forEachIndexed
                         val file = File(dir, "%03d.jpg".format(index))
                         if (file.exists() && file.length() > 0) {
                             // 已存在且非空跳过，但仍推进进度条
                             val pct = ((done + (index + 1).toFloat() / images.size) / chapters.size * 100).toInt()
                             if (pct - lastEmitPct >= 3 || index == images.lastIndex) {
-                                update(comicId) { it.copy(progress = pct) }
+                                updateIfCurrent(comicId, runToken) { it.copy(progress = pct) }
                                 lastEmitPct = pct
                             }
                             return@forEachIndexed
@@ -538,13 +669,15 @@ class DownloadManager(
                         // 单图下载：失败计数而非吞掉
                         // 关键修复：用 .tmp 临时文件 + renameTo 原子落盘，
                         // 避免下载中断留下半成品文件被重试时误认为已完成
-                        val tmp = File(dir, "%03d.jpg.tmp".format(index))
+                        val tmp = File(dir, "%03d.jpg.tmp.%s".format(index, runToken))
                         val ok = try {
                             if (useBackend) {
                                 downloadFile(proxiedImageUrl(serverUrl, raw), tmp)
                             } else {
                                 downloadAndDecode(raw, scrambleId, tmp)
                             }
+                            coroutineContext.ensureActive()
+                            if (runTokens[comicId] != runToken) throw CancellationException("下载已停止")
                             // 下载成功后原子重命名到目标文件
                             if (tmp.exists() && tmp.length() > 0) {
                                 file.delete()
@@ -567,21 +700,27 @@ class DownloadManager(
                             false
                         }
                         if (!ok) totalFailedImages++
+                        else downloadedBytes += file.length()
+                        val elapsed = (android.os.SystemClock.elapsedRealtime() - rateStart).coerceAtLeast(1)
+                        val speed = downloadedBytes * 1000 / elapsed
+                        val percentage = ((done + (index + 1).toFloat() / images.size) / chapters.size * 100).toInt()
+                        val eta = if (speed > 0 && percentage > 0) elapsed / 1000 * (100 - percentage) / percentage else null
+                        updateIfCurrent(comicId, runToken) { it.copy(bytesPerSecond = speed, etaSeconds = eta) }
                         val pct = ((done + (index + 1).toFloat() / images.size) / chapters.size * 100).toInt()
                         // v27.5 性能修复：≥3% 变化或最后一张才 emit，避免每图都 emit 整列表
                         if (pct - lastEmitPct >= 3 || index == images.lastIndex) {
-                            update(comicId) { it.copy(progress = pct, failedImages = totalFailedImages) }
+                            updateIfCurrent(comicId, runToken) { it.copy(progress = pct, failedImages = totalFailedImages) }
                             lastEmitPct = pct
                         }
                     }
                 }
                 else -> {
-                    update(comicId) { it.copy(status = DownloadStatus.FAILED) }
+                    updateIfCurrent(comicId, runToken) { it.copy(status = DownloadStatus.FAILED) }
                     return
                 }
             }
             done++
-            update(comicId) {
+            updateIfCurrent(comicId, runToken) {
                 it.copy(
                     doneChapters = done,
                     progress = (done * 100 / chapters.size.coerceAtLeast(1)),
@@ -590,14 +729,16 @@ class DownloadManager(
         }
 
         // 失败比例 > 30% → 标 FAILED
-        val failRate = if (totalImages > 0) totalFailedImages.toFloat() / totalImages else 0f
-        val finalStatus = if (failRate > 0.3f) DownloadStatus.FAILED else DownloadStatus.COMPLETED
-        update(comicId) {
-            it.copy(
-                status = finalStatus,
-                progress = 100,
-                failedImages = totalFailedImages,
-            )
+        val actualDone = chapters.count { it.id !in skippedChapters[comicId].orEmpty() && isChapterDownloaded(comicId, it.id) }
+        val finalStatus = if (actualDone != chapters.size) DownloadStatus.FAILED else DownloadStatus.COMPLETED
+        if (runTokens[comicId] == runToken) {
+            updateIfCurrent(comicId, runToken) {
+                it.copy(
+                    status = finalStatus,
+                    progress = actualDone * 100 / chapters.size, doneChapters = actualDone,
+                    failedImages = totalFailedImages, bytesPerSecond = 0, etaSeconds = null, currentChapterId = null,
+                )
+            }
         }
         com.jmreader.core.Logger.i(
             "Download",
@@ -612,9 +753,9 @@ class DownloadManager(
     /** 协程是否仍活跃（未被 cancel）。必须在 suspend 上下文中调用。 */
     private suspend fun isActive(): Boolean = kotlin.coroutines.coroutineContext[Job]?.isActive ?: true
 
-    private fun downloadFile(url: String, target: File) {
+    private suspend fun downloadFile(url: String, target: File) {
         val req = Request.Builder().url(url).build()
-        http.newCall(req).execute().use { resp ->
+        http.executeCancellable(req).use { resp ->
             if (!resp.isSuccessful) error("download ${resp.code}")
             // body 为 null 时抛异常，避免创建空文件被误认为下载成功
             val body = resp.body ?: error("空响应 body")
@@ -633,7 +774,7 @@ class DownloadManager(
      * 3) 最终 compress 成 JPEG → 动图变静图，动画完全丢失。
      * 现在与 JmImageFetcher.fetch 对齐：GIF 或 num==0 时原样落盘，保留动图。
      */
-    private fun downloadAndDecode(url: String, scrambleId: Long, target: File) {
+    private suspend fun downloadAndDecode(url: String, scrambleId: Long, target: File) {
         // 去掉所有 query 参数（jm_sid、v 等）拿到真实图片 URL
         val cleanUrl = url.substringBefore('?')
         val aid = com.jmreader.data.api.direct.JmImageDecoder.parseAidFromUrl(cleanUrl)
@@ -658,7 +799,7 @@ class DownloadManager(
                 .header("Referer", "https://www.cdnaspa.club/")
                 .build()
             try {
-                http.newCall(req).execute().use { resp ->
+                http.executeCancellable(req).use { resp ->
                     if (!resp.isSuccessful) error("download ${resp.code}")
                     val bytes = resp.body?.bytes() ?: error("空响应")
                     // GIF / 无需分割：原样落盘，保留动图；否则解密分割图。
@@ -668,7 +809,10 @@ class DownloadManager(
                     if (host != currentHost) container.directClient.selectImageDomain(host)
                     return
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Throwable) {
+                coroutineContext.ensureActive()
                 lastErr = e
             }
         }
@@ -681,9 +825,172 @@ class DownloadManager(
         return "${m.groupValues[1]}$newHost${m.groupValues[3]}"
     }
 
+    internal suspend fun <T> withRestoreGate(block: suspend () -> T): T = restoreMutex.withLock {
+        ensureLoaded()
+        val old = synchronized(jobs) {
+            restoring = true
+            runTokens.clear()
+            val list = jobs.values.toList() + removals.values.toList()
+            jobs.values.forEach { it.cancel() }
+            jobs.clear()
+            _tasks.update { tasks -> tasks.map { task ->
+                if (task.status in setOf(DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.WAITING))
+                    task.copy(status = DownloadStatus.PAUSED, bytesPerSecond = 0, etaSeconds = null, waitingReason = null)
+                else task
+            } }
+            list
+        }
+        try {
+            old.forEach { it.join() }
+            val result = block()
+            flushIndex()
+            result
+        } finally { synchronized(jobs) { restoring = false } }
+    }
+
+    private suspend fun flushIndex() {
+        persistJob?.cancel()
+        loaded.await()
+        persistMutex.withLock { writeIndex() }
+    }
+
+    private fun writeIndex() {
+        val records = _tasks.value.mapNotNull { task ->
+            detailCache[task.comic.id]?.let { detail ->
+                PersistedDownload(task.comic, detail, task.status, task.progress, task.totalChapters,
+                    task.doneChapters, task.failedImages, skippedChapters[task.comic.id].orEmpty())
+            }
+        }
+        val atomic = AtomicFile(taskFile)
+        val output = atomic.startWrite()
+        try { output.write(taskAdapter.toJson(records).toByteArray(Charsets.UTF_8)); atomic.finishWrite(output) }
+        catch (e: Throwable) { atomic.failWrite(output); throw e }
+    }
+
+    internal suspend fun exportRecords(): List<PersistedDownload> {
+        ensureLoaded()
+        return _tasks.value.mapNotNull { task ->
+            detailCache[task.comic.id]?.let { detail ->
+                PersistedDownload(task.comic, detail, task.status, task.progress, task.totalChapters,
+                    task.doneChapters, task.failedImages, skippedChapters[task.comic.id].orEmpty())
+            }
+        }
+    }
+
+    internal suspend fun importRecords(records: List<PersistedDownload>, merge: Boolean) {
+        ensureLoaded()
+        // Stop existing writers before replacing the index, retaining their offline files.
+        val active = synchronized(jobs) {
+            runTokens.clear()
+            jobs.values.toList().also { list -> list.forEach { it.cancel() }; jobs.clear() }
+        }
+        active.forEach { it.join() }
+        synchronized(jobs) {
+            val current = if (merge) _tasks.value else emptyList()
+            if (!merge) { detailCache.clear(); skippedChapters.clear() }
+            val accepted = records.filterNot { record -> current.any { it.comic.id == record.comic.id } }
+            accepted.forEach { detailCache[it.comic.id] = it.detail; skippedChapters[it.comic.id] = it.skippedChapterIds }
+            _tasks.value = current.map { task ->
+                if (task.status in setOf(DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.WAITING)) task.copy(status = DownloadStatus.PAUSED) else task
+            } + accepted.map { record ->
+                val complete = record.detail.chapters.isNotEmpty() && record.detail.chapters.all { isChapterDownloaded(record.comic.id, it.id) }
+                DownloadTask(record.comic, if (complete) DownloadStatus.COMPLETED else DownloadStatus.PAUSED,
+                    if (complete) 100 else 0, record.detail.chapters.size,
+                    record.detail.chapters.count { isChapterDownloaded(record.comic.id, it.id) },
+                    skippedChapterIds = record.skippedChapterIds)
+            }
+            schedulePersist()
+        }
+        flushIndex()
+    }
+
+    suspend fun ensureLoaded() { loaded.await() }
+
+    /** Download policies are checked between images; a manual pause cancels the active call. */
+    private suspend fun awaitConditions(comicId: String, token: String) {
+        while (true) {
+            coroutineContext.ensureActive()
+            if (runTokens[comicId] != token) throw CancellationException("任务已停止")
+            val device = container.deviceConditions.state.value
+            val settings = container.settingsStore.currentSnapshot
+            val reason = when {
+                !device.online -> "等待网络连接"
+                settings.downloadWifiOnly && !device.wifi -> "等待 Wi-Fi"
+                settings.downloadChargingOnly && !device.charging -> "等待充电"
+                else -> null
+            }
+            if (reason == null) {
+                updateIfCurrent(comicId, token) { it.copy(status = DownloadStatus.DOWNLOADING, waitingReason = null) }
+                return
+            }
+            updateIfCurrent(comicId, token) { it.copy(status = DownloadStatus.WAITING, waitingReason = reason, bytesPerSecond = 0, etaSeconds = null) }
+            delay(1_000)
+        }
+    }
+
+    fun chapters(comicId: String) = detailCache[comicId]?.chapters.orEmpty()
+
+    /** Cancel this chapter only, keeping other chapters queued and any existing files. */
+    fun cancelChapter(comicId: String, chapterId: String): Boolean = synchronized(jobs) {
+        if (restoring) return false
+        val task = _tasks.value.firstOrNull { it.comic.id == comicId } ?: return false
+        if (chapters(comicId).none { it.id == chapterId }) return false
+        skippedChapters[comicId] = skippedChapters[comicId].orEmpty() + chapterId
+        update(comicId) { it.copy(skippedChapterIds = skippedChapters[comicId].orEmpty()) }
+        if (task.currentChapterId == chapterId && task.status in setOf(DownloadStatus.DOWNLOADING, DownloadStatus.WAITING) && pause(comicId)) resume(task.comic)
+        return true
+    }
+
+    fun retryChapter(comicId: String, chapterId: String): Boolean = synchronized(jobs) {
+        if (restoring) return false
+        val task = _tasks.value.firstOrNull { it.comic.id == comicId } ?: return false
+        val detail = detailCache[comicId] ?: return false
+        if (detail.chapters.none { it.id == chapterId }) return false
+        skippedChapters[comicId] = skippedChapters[comicId].orEmpty() - chapterId
+        // Retry scans completed files and only fetches missing pages.
+        if (task.status in setOf(DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.WAITING)) pause(comicId)
+        enqueue(task.comic, detail, onlyChapterIds = setOf(chapterId))
+        return true
+    }
+
     private fun update(comicId: String, transform: (DownloadTask) -> DownloadTask) {
         // 原子 CAS 更新，避免并发覆盖
         _tasks.update { list -> list.map { if (it.comic.id == comicId) transform(it) else it } }
+        schedulePersist()
+    }
+
+    private fun updateIfCurrent(
+        comicId: String,
+        runToken: String,
+        transform: (DownloadTask) -> DownloadTask,
+    ) {
+        synchronized(jobs) {
+            if (runTokens[comicId] == runToken) update(comicId, transform)
+        }
+    }
+
+    /** 暂停下载，保留已下载文件和任务详情，稍后可继续。 */
+    fun pause(comicId: String): Boolean = synchronized(jobs) {
+        if (restoring) return false
+        val task = _tasks.value.firstOrNull { it.comic.id == comicId } ?: return false
+        if (task.status !in setOf(DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.WAITING)) return false
+        pausedIds.add(comicId)
+        runTokens.remove(comicId)
+        jobs[comicId]?.cancel()
+        update(comicId) { it.copy(status = DownloadStatus.PAUSED, bytesPerSecond = 0, etaSeconds = null, waitingReason = null) }
+        true
+    }
+
+
+    /** 继续已暂停或进程重启后恢复的任务；已有文件会被跳过。 */
+    fun resume(comic: ComicBriefDto): Boolean = synchronized(jobs) {
+        if (restoring) return false
+        val task = _tasks.value.firstOrNull { it.comic.id == comic.id } ?: return false
+        if (task.status != DownloadStatus.PAUSED) return false
+        val detail = detailCache[comic.id] ?: return false
+        pausedIds.remove(comic.id)
+        enqueue(comic, detail)
+        return true
     }
 
     /**
@@ -697,15 +1004,25 @@ class DownloadManager(
      * 现在 IO 删除挪到 scope（Dispatchers.IO），主线程立即返回，UI 不卡顿。
      */
     fun remove(comicId: String) {
-        synchronized(jobs) { jobs.remove(comicId)?.cancel() }
-        _tasks.update { list -> list.filterNot { it.comic.id == comicId } }
-        detailCache.remove(comicId)
-        scope.launch {
-            runCatching { File(rootDir(), comicId).deleteRecursively() }
-            // v27.6：同时删除 SAF 中的副本
-            removeSaf(comicId)
+        synchronized(jobs) {
+            if (restoring) return
+            touchedIds.add(comicId)
+            runTokens.remove(comicId)
+            pausedIds.remove(comicId)
+            skippedChapters.remove(comicId)
+            val previous = jobs.remove(comicId)
+            previous?.cancel()
+            _tasks.update { list -> list.filterNot { it.comic.id == comicId } }
+            detailCache.remove(comicId)
+            removals[comicId] = scope.launch {
+                previous?.join()
+                runCatching { File(rootDir(), comicId).deleteRecursively() }
+                removeSaf(comicId)
+            }
+            schedulePersist()
         }
     }
+
 
     /**
      * 重试已失败的任务：从失败处继续（已下载的章节图片文件保留，runDownload 会自动跳过）。
@@ -713,7 +1030,8 @@ class DownloadManager(
      * 优先使用 enqueue 时缓存的 detail；若缓存已丢失（如进程重启），调用方需传入 detail。
      * @return true=已触发重试；false=任务不存在/状态非 FAILED/无 detail 无法重试
      */
-    fun retry(comic: ComicBriefDto, detail: ComicDetailDto? = null): Boolean {
+    fun retry(comic: ComicBriefDto, detail: ComicDetailDto? = null): Boolean = synchronized(jobs) {
+        if (restoring) return false
         // 仅对 FAILED 任务重试
         val existing = _tasks.value.firstOrNull { it.comic.id == comic.id } ?: return false
         if (existing.status != DownloadStatus.FAILED) return false

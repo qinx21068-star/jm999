@@ -31,6 +31,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -51,6 +52,7 @@ import coil.request.ImageRequest
 import com.jmreader.data.AppContainer
 import com.jmreader.data.local.HistoryEntry
 import com.jmreader.ui.components.EmptyBox
+import com.jmreader.ui.components.LoadingBox
 import com.jmreader.ui.nav.Routes
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
@@ -77,6 +79,11 @@ fun ReadingHistoryTab(
     snackbar: SnackbarHostState,
 ) {
     val history by container.historyStore.items.collectAsState()
+    var historyLoaded by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        container.historyStore.ensureLoaded()
+        historyLoaded = true
+    }
     val scope = rememberCoroutineScope()
     var showClearConfirm by remember { mutableStateOf(false) }
     // 屏蔽规则过滤（与 FavoritesScreen 浏览历史一致）
@@ -96,7 +103,9 @@ fun ReadingHistoryTab(
     }
 
     Box(Modifier.fillMaxSize()) {
-        if (history.isEmpty()) {
+        if (!historyLoaded) {
+            LoadingBox()
+        } else if (history.isEmpty()) {
             EmptyBox("还没有阅读历史")
         } else if (visible.isEmpty()) {
             EmptyBox("所有阅读历史都被屏蔽规则过滤")
@@ -123,7 +132,7 @@ fun ReadingHistoryTab(
                             // Thread.uncaughtExceptionHandler → CrashHandler → 杀进程。包 try-catch。
                             scope.launch {
                                 try {
-                                    container.historyStore.remove(entry.comic.id)
+                                    container.historyStore.remove(entry.comic.id, entry.chapterId)
                                     snackbar.showSnackbar("已删除")
                                 } catch (e: kotlinx.coroutines.CancellationException) {
                                     throw e
@@ -230,7 +239,8 @@ private fun HistoryRow(
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text(
-                entry.comic.name,
+                entry.comic.name.takeIf { it.isNotBlank() && it != entry.comic.id }
+                    ?: "JM${entry.comic.id}",
                 style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.SemiBold,
                 maxLines = 1,

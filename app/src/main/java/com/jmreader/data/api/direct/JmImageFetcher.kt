@@ -2,6 +2,16 @@ package com.jmreader.data.api.direct
 
 import android.net.Uri
 import coil.ImageLoader
+import coil.disk.DiskCache
+import kotlinx.coroutines.ensureActive
+import kotlin.coroutines.coroutineContext
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Dispatchers
 import coil.decode.DataSource
 import coil.decode.ImageSource
 import coil.fetch.FetchResult
@@ -26,20 +36,48 @@ import java.io.File
  * 4. 返回解密后的字节作为 SourceResult 给 Coil
  *
  * 用 SourceResult 而非 DrawableResult：
- * - SourceResult 会被 Coil 写入磁盘缓存（DrawableResult 不会），避免重复下载+解密
+ * - 明确读写解密后的 DiskCache 数据，避免重复下载和分割解密
  * - telephoto 的子采样分块能直接复用解密后的字节，不会绕过 Fetcher 加载未解密原图
- * - Fetcher 内不自行 BitmapFactory.decodeByteArray，避免大图 OOM；由 Coil 按 target 尺寸降采样解码
+ * - 分割还原后由 Coil 按显示尺寸解码；缓存保存完整清晰度的字节
  *
  * 若 jm_sid 不存在（如封面、普通图片），交给 Coil 默认 HttpFetcher 处理。
  */
+@OptIn(coil.annotation.ExperimentalCoilApi::class)
 class JmImageFetcher(
     private val client: OkHttpClient,
     private val directClient: JmDirectClient,
     private val data: String,
     private val tempDir: File,
+    private val diskCache: DiskCache?,
+    private val options: Options,
 ) : Fetcher {
 
-    override suspend fun fetch(): FetchResult? {
+    override suspend fun fetch(): FetchResult? = withContext(Dispatchers.IO) {
+        // Include scramble/version metadata but ignore a rotating CDN host.
+        val key = options.diskCacheKey ?: decodedCacheKey(data)
+        ImageFetchLocks.withKey(key) {
+            val snapshot = if (options.diskCachePolicy.readEnabled) diskCache?.openSnapshot(key) else null
+            if (snapshot != null) {
+                try {
+                    val mime = snapshot.metadata.toFile().readText().ifBlank { null }
+                    if (snapshot.data.toFile().length() <= 0) throw java.io.IOException("缓存图片为空")
+                    return@withKey SourceResult(
+                        source = ImageSource(snapshot.data, diskCacheKey = key, closeable = snapshot),
+                        mimeType = mime,
+                        dataSource = DataSource.DISK,
+                    )
+                } catch (e: Throwable) {
+                    snapshot.close()
+                    if (e is CancellationException) throw e
+                    diskCache?.remove(key)
+                }
+            }
+            if (!options.networkCachePolicy.readEnabled) throw java.io.IOException("此图片尚未缓存")
+            fetchUncached()
+        }
+    }
+
+    private suspend fun fetchUncached(): FetchResult? {
         // 仅处理带 jm_sid 的禁漫图片 URL
         val sidMarker = "jm_sid="
         val sidIdx = data.indexOf(sidMarker)
@@ -73,12 +111,12 @@ class JmImageFetcher(
             bytes
         } else {
             val before = bytes.size
-            val out = JmImageDecoder.decodeToBytes(bytes, scrambleId, aid, filename)
+            val out = decodeLimit.withPermit { JmImageDecoder.decodeToBytes(bytes, scrambleId, aid, filename) }
             // 简单探测：解密成功时 out 是重编码的 JPEG，size 通常与原 webp 不同；
             // 解密失败时 out === bytes（原样返回），size 完全一致。
             decodeFailed = (out.size == before) && out === bytes
             if (decodeFailed) {
-                Logger.w("JmImg", "解密失败，原样返回未解密字节: aid=$aid fn=$filename num=$num")
+                throw java.io.IOException("图片分割解密失败：$aid/$filename，请重试")
             }
             out
         }
@@ -98,22 +136,28 @@ class JmImageFetcher(
             else -> "image/jpeg"
         }
 
-        // 返回 SourceResult：Coil 自动写磁盘缓存 + telephoto 子采样可用，且不在此持有 Bitmap（省内存）
-        //
-        // v27.5 性能修复：去掉每次 fetch 的 cleanupOldTempFiles() 调用。
-        // 之前每张图都做：cleanupOldTempFiles() → tempDir.listFiles 遍历整个临时目录
-        // （1 小时累积 200+ 临时文件），每次遍历 5-50ms。
-        // 阅读器翻一章 30-50 张图 = 30-50 次 listFiles 遍历，弱网/慢存储累计卡顿。
-        // 现在用 AtomicInteger 计数，每 50 次 fetch 才清理一次，平时直接跳过。
-        //
-        // v27.5 稳定性加固（critical 修复）：tempFileCounter 之前是 JmImageFetcher 实例字段，
-        // 而 Factory 每次 fetch 都 new 一个 JmImageFetcher → 计数器每次都从 0 开始 →
-        // `1 % 50 != 0` → cleanupOldTempFiles 永远不被调用 → 临时文件无限累积撑爆存储。
-        // 现在改为 companion object（Factory 单例创建的 Fetcher 共享同一计数器），每 50 次 fetch 真正清理一次。
-        sharedTempFileCounter.incrementAndGet()
-        if (sharedTempFileCounter.get() % 20 == 0) {
-            cleanupOldTempFiles(tempDir)
+        // A custom Fetcher must explicitly persist its decoded bytes; SourceResult alone does not cache.
+        if (options.diskCachePolicy.writeEnabled) {
+            val key = options.diskCacheKey ?: decodedCacheKey(data)
+            val editor = diskCache?.openEditor(key)
+            if (editor != null) {
+                try {
+                    editor.data.toFile().writeBytes(decoded)
+                    editor.metadata.toFile().writeText(mimeType)
+                    val snapshot = editor.commitAndOpenSnapshot()
+                    if (snapshot != null) return SourceResult(
+                        source = ImageSource(snapshot.data, diskCacheKey = key, closeable = snapshot),
+                        mimeType = mimeType,
+                        dataSource = DataSource.NETWORK,
+                    )
+                } catch (e: Throwable) {
+                    runCatching { editor.abort() }
+                    if (e is CancellationException) throw e
+                    Logger.w("JmImg", "图片缓存写入失败，回退临时文件: ${Logger.brief(e)}")
+                }
+            }
         }
+
         val ext = if (mimeType == "image/gif") ".gif" else if (mimeType == "image/webp") ".webp" else ".jpg"
         // v27.5 稳定性加固：磁盘满/权限丢失/临时目录不存在时 createTempFile/writeBytes 会抛 IOException。
         // 让异常向上抛给 Coil，Coil 会转成 ErrorResult 并触发订阅方 onError，不会让进程崩溃。
@@ -128,31 +172,21 @@ class JmImageFetcher(
             throw e
         }
         return SourceResult(
-            source = ImageSource(tempFile.toOkioPath()),
+            source = ImageSource(tempFile.toOkioPath(), closeable = java.io.Closeable { tempFile.delete() }),
             mimeType = mimeType,
             dataSource = DataSource.NETWORK,
         )
     }
 
-    /** v27.5 稳定性加固：全局共享计数器，放在 companion object 保证 Factory 单例下所有 Fetcher 共用。 */
-    companion object {
-        private val sharedTempFileCounter = java.util.concurrent.atomic.AtomicInteger(0)
-    }
+    companion object { private val decodeLimit = Semaphore(2) }
 
-    /** v27.13：清理 5 分钟前的旧临时文件（原 1 小时太长，连续阅读会累积数百文件）。 */
-    private fun cleanupOldTempFiles(dir: File) {
-        runCatching {
-            val cutoff = System.currentTimeMillis() - 300_000L
-            dir.listFiles { f -> f.name.startsWith("jm_img_") && f.lastModified() < cutoff }
-                ?.forEach { it.delete() }
-        }
-    }
+    private fun decodedCacheKey(url: String): String = "jm-decoded-v1:" + android.net.Uri.parse(url).let { it.encodedPath.orEmpty() + "?" + it.encodedQuery.orEmpty() }
 
     /**
      * 下载图片字节。当前图片域名失败时，遍历其他图片域名重试，提高可用性。
      * 下载 URL 的 host 会被替换为候选域名；path/query 保持不变。
      */
-    private fun downloadWithRotate(originalUrl: String): ByteArray {
+    private suspend fun downloadWithRotate(originalUrl: String): ByteArray {
         val domains = directClient.imageDomainList()
         // 第一个候选是当前域名，后续按列表轮换
         val currentHost = directClient.currentImageDomain()
@@ -170,7 +204,7 @@ class JmImageFetcher(
                 .header("Referer", "https://www.cdnaspa.club/")
                 .build()
             try {
-                client.newCall(req).execute().use { resp ->
+                client.executeCancellable(req).use { resp ->
                     if (!resp.isSuccessful) throw RuntimeException("HTTP ${resp.code}")
                     val b = resp.body?.bytes() ?: throw RuntimeException("图片响应为空")
                     // 成功：若不是当前域名，精确切到这个可用的 host
@@ -178,7 +212,10 @@ class JmImageFetcher(
                     if (host != currentHost) directClient.selectImageDomain(host)
                     return b
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Throwable) {
+                coroutineContext.ensureActive()
                 Logger.w("JmImg", "下载失败 $tryUrl: ${Logger.brief(e)}")
                 lastErr = e
             }
@@ -220,9 +257,25 @@ class JmImageFetcher(
             // 导致禁漫图片走默认 HttpUriFetcher（未解密）→ 图片错位。
             val url = data.toString()
             if (url.startsWith("http") && url.contains("jm_sid=")) {
-                return JmImageFetcher(client, directClient, url, tempDir)
+                return JmImageFetcher(client, directClient, url, tempDir, imageLoader.diskCache, options)
             }
             return null
+        }
+    }
+}
+
+/** Reference-counted locks merge visible/prefetch requests for one image, without unbounded key retention. */
+private object ImageFetchLocks {
+    private data class Entry(val mutex: Mutex = Mutex(), var users: Int = 0)
+    private val entries = mutableMapOf<String, Entry>()
+    suspend fun <T> withKey(key: String, block: suspend () -> T): T {
+        val entry = synchronized(entries) { entries.getOrPut(key) { Entry() }.also { it.users++ } }
+        try { return entry.mutex.withLock { block() } }
+        finally {
+            synchronized(entries) {
+                entry.users--
+                if (entry.users == 0) entries.remove(key)
+            }
         }
     }
 }

@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.LazyListState
@@ -26,9 +27,13 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.PrimaryTabRow
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -39,12 +44,17 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavController
 import com.jmreader.R
 import com.jmreader.data.AppContainer
 import com.jmreader.data.dto.ComicBriefDto
+import com.jmreader.data.local.HistoryEntry
 import com.jmreader.data.repository.Resource
 import com.jmreader.ui.components.ComicList
 import com.jmreader.ui.components.EmptyBox
@@ -55,6 +65,8 @@ import com.jmreader.ui.nav.Routes
 import com.jmreader.ui.viewmodel.BaseListViewModel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
 
 /** 分类定义：slug 对应禁漫 /categories/filter 的 c 参数。 */
 data class Category(val slug: String, val label: String)
@@ -176,6 +188,13 @@ fun HomeScreen(container: AppContainer, navController: NavController) {
     // v27.5 性能优化：用 cachedSnapshot 作为 collectAsState 初始值，避免 null → 默认 → 真实 两轮重组
     val settings by container.settingsStore.settings.collectAsState(initial = container.settingsStore.cachedSnapshot)
     val listStyle = settings.listStyle
+    var showRandomReading by remember { mutableStateOf(false) }
+    val history by container.historyStore.items.collectAsState()
+    val recentReading = remember(history) {
+        history.sortedByDescending { it.updatedAt }
+            .distinctBy { it.comic.id }
+            .take(8)
+    }
     // 首次进入：触发「最新」tab 初始加载（BaseListViewModel 不会自动 refresh），
     // 并把「排行」tab 默认按观看 + 用户设置的周期加载
     // 关键修复（Bug 46）：用 setDefaults 一次性改 order+time，避免连续两次 refresh。
@@ -234,6 +253,18 @@ fun HomeScreen(container: AppContainer, navController: NavController) {
     // 用 Box 包裹以承载 SnackbarHost：长按屏蔽/收藏操作需要反馈
     Box(Modifier.fillMaxSize()) {
      Column(Modifier.fillMaxSize()) {
+        if (recentReading.isNotEmpty()) {
+            ContinueReadingSection(
+                entries = recentReading,
+                onContinue = { entry ->
+                    navController.navigate(Routes.reader(entry.comic.id, entry.chapterId))
+                },
+                onOpenDetail = { entry ->
+                    navController.navigate(Routes.detail(entry.comic.id))
+                },
+            )
+        }
+        TextButton(onClick = { showRandomReading = true }, modifier = Modifier.fillMaxWidth()) { Text("从收藏 / 历史随机阅读") }
         PrimaryTabRow(selectedTabIndex = tab) {
             Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text(stringResource(R.string.home_latest)) })
             Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text(stringResource(R.string.home_ranking)) })
@@ -247,9 +278,9 @@ fun HomeScreen(container: AppContainer, navController: NavController) {
         // ComicList 的 header 参数不稳定 → ComicList 无法跳过重组 → LazyColumn 重新组合。
         // remember 依赖列表只包含影响 header 内容的变量，state 不在依赖中
         // （header 内只用 state.refreshing，用 derivedStateOf 细粒度订阅避免整体重组）。
-        val headerRefreshing by remember(current) {
-            derivedStateOf { current.state.value.refreshing }
-        }
+        // state 已由 current.state.collectAsState() 订阅；不要用 derivedStateOf 读取
+        // StateFlow.value，它不会建立 Compose Snapshot 依赖，刷新图标会永远停在初始状态。
+        val headerRefreshing = state.refreshing
         val filterHeader: @androidx.compose.runtime.Composable () -> Unit = remember(
             tab, rankVm, latestVm, current, headerRefreshing, onRefresh,
         ) {
@@ -361,7 +392,7 @@ fun HomeScreen(container: AppContainer, navController: NavController) {
         }
         // 触底加载更多已移入 ComicList 内部（基于 onLoadMore 回调），
         // 这样列表/网格两种样式都能自动 loadMore，无需调用方按 listState 写 derivedStateOf。
-        Box(Modifier.fillMaxSize()) {
+        Box(Modifier.fillMaxWidth().weight(1f)) {
             // v27.5 稳定性加固：捕获 state 到本地 val，避免 state.error!! race condition NPE
             val s = state
             when {
@@ -415,4 +446,91 @@ fun HomeScreen(container: AppContainer, navController: NavController) {
          modifier = Modifier.align(androidx.compose.ui.Alignment.BottomCenter),
      )
     } // end Box
+    if (showRandomReading) com.jmreader.ui.screen.favorites.RandomReadingDialog(container, navController) { showRandomReading = false }
+}
+
+@Composable
+private fun ContinueReadingSection(
+    entries: List<HistoryEntry>,
+    onContinue: (HistoryEntry) -> Unit,
+    onOpenDetail: (HistoryEntry) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 8.dp, bottom = 4.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+        ) {
+            Text(
+                "继续阅读",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                "${entries.size} 本",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        LazyRow(
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            items(entries, key = { it.comic.id.ifBlank { "history_${it.chapterId}" } }) { entry ->
+                Card(
+                    onClick = { onContinue(entry) },
+                    modifier = Modifier.size(width = 250.dp, height = 104.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                    ),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxSize().padding(10.dp),
+                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                    ) {
+                        AsyncImage(
+                            model = ImageRequest.Builder(LocalContext.current)
+                                .data(entry.comic.cover)
+                                .crossfade(false)
+                                .build(),
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier
+                                .size(width = 58.dp, height = 82.dp)
+                                .clip(RoundedCornerShape(8.dp)),
+                        )
+                        Column(
+                            modifier = Modifier.weight(1f).padding(start = 10.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text(
+                                entry.comic.name.takeIf { it.isNotBlank() && it != entry.comic.id }
+                                    ?: "JM${entry.comic.id}",
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = androidx.compose.ui.text.font.FontWeight.Medium,
+                            )
+                            Text(
+                                "${entry.chapterTitle.ifBlank { entry.chapterId }} · 第 ${entry.page + 1} 页",
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            TextButton(
+                                onClick = { onOpenDetail(entry) },
+                                contentPadding = PaddingValues(0.dp),
+                            ) { Text("查看详情") }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

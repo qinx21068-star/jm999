@@ -143,8 +143,12 @@ class FavoritesStore(context: Context, moshi: Moshi, scope: CoroutineScope) {
                 if (!seenIds.add(c.id)) continue
                 entries.add(FavoriteEntry(comic = dedupTags(c), folderId = null))
             }
-            // 立即落盘迁移到 v2，避免下次启动再次走 v1 分支
-            runCatching { persist(emptyList(), entries) }
+            // 迁移前保留原始文件，避免边界数据被过滤后空 v2 覆盖原收藏。
+            runCatching {
+                file.copyTo(File(file.parentFile, "favorites.json.bak"), overwrite = true)
+            }
+            // 只有解析出条目才立即迁移，空结果保留原文件供恢复。
+            if (entries.isNotEmpty()) runCatching { persist(emptyList(), entries) }
             return emptyList<FavoriteFolder>() to entries
         }
         // v2：JSON 对象，用 Moshi 直接反序列化 FavoriteStoreData
@@ -202,6 +206,7 @@ class FavoritesStore(context: Context, moshi: Moshi, scope: CoroutineScope) {
      * v27.15.2：用 filterNot 移除所有同 id 条目（防御性，避免异常数据残留导致重复）。
      */
     suspend fun toggle(item: ComicBriefDto, folderId: String? = null): Boolean = withContext(Dispatchers.IO) {
+        ensureLoaded()
         mutex.withLock {
             val oldList = _entries.value
             val filtered = oldList.filterNot { it.comic.id == item.id }
@@ -219,36 +224,75 @@ class FavoritesStore(context: Context, moshi: Moshi, scope: CoroutineScope) {
                 nowFavorite = true
                 oldList.toMutableList().apply { add(0, FavoriteEntry(comic = safeItem, folderId = folderId)) }
             }
-            _entries.value = list
             persist(_folders.value, list)
+            _entries.value = list
             nowFavorite
+        }
+    }
+
+    suspend fun moveMany(ids: Set<String>, folderId: String?) = withContext(Dispatchers.IO) {
+        ensureLoaded()
+        mutex.withLock {
+            require(folderId == null || folderId == READ_LATER_FOLDER_ID || _folders.value.any { it.id == folderId })
+            val next = _entries.value.map { if (it.comic.id in ids) it.copy(folderId = folderId) else it }
+            persist(_folders.value, next)
+            _entries.value = next
+        }
+    }
+
+    suspend fun removeMany(ids: Set<String>) = withContext(Dispatchers.IO) {
+        ensureLoaded()
+        mutex.withLock {
+            val next = _entries.value.filterNot { it.comic.id in ids }
+            persist(_folders.value, next)
+            _entries.value = next
+        }
+    }
+
+    suspend fun importData(data: FavoriteStoreData, merge: Boolean) = withContext(Dispatchers.IO) {
+        ensureLoaded()
+        mutex.withLock {
+            val folders = ((if (merge) _folders.value else emptyList()) + data.folders).distinctBy { it.id }
+            val entries = ((if (merge) _entries.value else emptyList()) + data.entries)
+                .filter { it.comic.id.isNotBlank() }.distinctBy { it.comic.id }
+                .map { e ->
+                    e.copy(comic = dedupTags(e.comic), folderId = e.folderId.takeIf { id ->
+                        id == READ_LATER_FOLDER_ID || folders.any { it.id == id }
+                    })
+                }
+            persist(folders, entries)
+            _folders.value = folders
+            _entries.value = entries
         }
     }
 
     /** 移动已收藏的条目到指定分组。条目不存在则忽略。 */
     suspend fun moveToFolder(comicId: String, folderId: String?) = withContext(Dispatchers.IO) {
+        ensureLoaded()
         mutex.withLock {
             // v27.15.2：map 全量替换（与 toggle/addReadLater 一致），防御历史重复 id 数据
             val old = _entries.value
             if (old.none { it.comic.id == comicId }) return@withContext
             val list = old.map { e -> if (e.comic.id == comicId) e.copy(folderId = folderId) else e }
-            _entries.value = list
             persist(_folders.value, list)
+            _entries.value = list
         }
     }
 
     suspend fun remove(id: String) = withContext(Dispatchers.IO) {
+        ensureLoaded()
         mutex.withLock {
             val list = _entries.value.filterNot { it.comic.id == id }
-            _entries.value = list
             persist(_folders.value, list)
+            _entries.value = list
         }
     }
 
     suspend fun clear() = withContext(Dispatchers.IO) {
+        ensureLoaded()
         mutex.withLock {
+            persist(_folders.value, emptyList())
             _entries.value = emptyList()
-            runCatching { file.delete() }
         }
     }
 
@@ -259,25 +303,27 @@ class FavoritesStore(context: Context, moshi: Moshi, scope: CoroutineScope) {
      * @return 创建出的 [FavoriteFolder]
      */
     suspend fun createFolder(name: String): FavoriteFolder = withContext(Dispatchers.IO) {
+        ensureLoaded()
         val trimmed = name.trim()
         val folder = FavoriteFolder(id = UUID.randomUUID().toString(), name = trimmed.ifBlank { "新分组" })
         mutex.withLock {
             val list = _folders.value + folder
-            _folders.value = list
             persist(list, _entries.value)
+            _folders.value = list
         }
         folder
     }
 
     /** 重命名分组。分组不存在则忽略。 */
     suspend fun renameFolder(id: String, newName: String) = withContext(Dispatchers.IO) {
+        ensureLoaded()
         mutex.withLock {
             val list = _folders.value.toMutableList()
             val idx = list.indexOfFirst { it.id == id }
             if (idx < 0) return@withContext
             list[idx] = list[idx].copy(name = newName.trim().ifBlank { list[idx].name })
-            _folders.value = list
             persist(list, _entries.value)
+            _folders.value = list
         }
     }
 
@@ -287,15 +333,16 @@ class FavoritesStore(context: Context, moshi: Moshi, scope: CoroutineScope) {
      * - 非 null=移到指定分组（需存在）
      */
     suspend fun deleteFolder(id: String, moveToFolderId: String? = null) = withContext(Dispatchers.IO) {
+        ensureLoaded()
         mutex.withLock {
             val folders = _folders.value.filterNot { it.id == id }
             val target = moveToFolderId?.let { tid -> folders.firstOrNull { it.id == tid }?.id }
             val entries = _entries.value.map { e ->
                 if (e.folderId == id) e.copy(folderId = target) else e
             }
+            persist(folders, entries)
             _folders.value = folders
             _entries.value = entries
-            persist(folders, entries)
         }
     }
 
@@ -333,6 +380,7 @@ class FavoritesStore(context: Context, moshi: Moshi, scope: CoroutineScope) {
      * @return true 表示新增；false 表示从其他分组移动过来。
      */
     suspend fun addReadLater(item: ComicBriefDto): Boolean = withContext(Dispatchers.IO) {
+        ensureLoaded()
         mutex.withLock {
             val oldList = _entries.value
             // 移除所有同 id 的旧条目（防止重复）
@@ -340,8 +388,8 @@ class FavoritesStore(context: Context, moshi: Moshi, scope: CoroutineScope) {
             val isNew = list.size == oldList.size // 没移除过 = 之前不存在 = 新增
             val safeItem = dedupTags(item)
             list.add(0, FavoriteEntry(comic = safeItem, folderId = READ_LATER_FOLDER_ID))
-            _entries.value = list
             persist(_folders.value, list)
+            _entries.value = list
             isNew
         }
     }
@@ -377,6 +425,7 @@ class FavoritesStore(context: Context, moshi: Moshi, scope: CoroutineScope) {
             }
         }.onFailure { e ->
             com.jmreader.core.Logger.w("Favorites", "收藏落盘失败（内存态与磁盘态不一致，重启后可能回退）: ${com.jmreader.core.Logger.brief(e)}")
+            throw e
         }
     }
 }

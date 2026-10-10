@@ -1,6 +1,7 @@
 package com.jmreader.data.api.direct
 
 import com.jmreader.core.Logger
+import com.jmreader.data.api.NetworkFactory
 import com.jmreader.data.dto.ChapterDto
 import com.jmreader.data.dto.ChapterImagesDto
 import com.jmreader.data.dto.ComicBriefDto
@@ -8,6 +9,8 @@ import com.jmreader.data.dto.ComicDetailDto
 import com.jmreader.data.dto.JmCommentDto
 import com.jmreader.data.dto.JmCommentPageDto
 import com.jmreader.data.dto.PageResultDto
+import kotlinx.coroutines.ensureActive
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -25,6 +28,9 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.Proxy
+import java.net.ProxySelector
+import java.net.URI
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
@@ -87,6 +93,8 @@ class JmDirectClient(
         "https://rup4a04-c03.tos-cn-beijing.bytepluses.com.cn/newsvr-2025.txt",
     )
     @Volatile private var lastDomainRefreshMs = 0L
+    @Volatile private var lastDomainRefreshAttemptMs = 0L
+    @Volatile private var domainRefreshInFlight = false
     private val refreshLock = Any()
 
     // ---- 图片 CDN 域名池 ----
@@ -111,26 +119,35 @@ class JmDirectClient(
 
     /**
      * v27.5 #37：当前代理设置（null=不走代理）。
-     * 改动时通过 [applyProxy] 重建 [http]/[fastHttp]。
+     * 改动时通过 [applyProxy] 更新动态 ProxySelector。
      */
     @Volatile private var currentProxy: String? = null
+    @Volatile private var selectedProxy: Proxy = Proxy.NO_PROXY
+    private val dynamicProxySelector = object : ProxySelector() {
+        override fun select(uri: URI): List<Proxy> {
+            return listOf(selectedProxy)
+        }
+
+        override fun connectFailed(uri: URI, sa: java.net.SocketAddress, ioe: java.io.IOException) {
+            Logger.w("JmDirect", "代理连接失败 ${uri.host}: ${Logger.brief(ioe)}")
+        }
+    }
 
     /**
      * 主请求 client（长超时，用于业务接口）。
      *
-     * v27.5 #37：改为 @Volatile var，[applyProxy] 切换代理时整体替换。
-     * - 已 in-flight 的请求仍用旧 client 完成（OkHttp 内部队列）
-     * - 新请求读 latest 引用，用新 client
-     * - Coil 的 ImageLoader 在启动时绑定一次，运行时切代理不会立即生效；
-     *   需重启进程或调用 [com.jmreader.core.CoilSetup.bindOkHttp] 重新绑定。
+     * v27.5 #37：客户端长期复用动态 ProxySelector；[applyProxy] 不重建连接池。
+     * - 已 in-flight 的请求继续完成
+     * - 后续请求读取最新代理
+     * - Coil 复用同一客户端，图片请求无需重启进程即可切换线路。
      */
-    @Volatile var http: OkHttpClient = buildMainHttp(null)
+    @Volatile var http: OkHttpClient = buildMainHttp()
         private set
 
     /** v27.3 根因 #2：轮换/自愈专用短超时 client。同 [http]，代理切换时整体替换。 */
-    @Volatile private var fastHttp: OkHttpClient = buildFastHttp(null)
+    @Volatile private var fastHttp: OkHttpClient = buildFastHttp()
 
-    private fun buildMainHttp(proxyStr: String?): OkHttpClient {
+    private fun buildMainHttp(): OkHttpClient {
         // v27.6 性能优化：增大连接池（默认 5 连接不够禁漫 8+ API 域名 + 6 图片 CDN 共用）
         // 和 Dispatcher 每域并发（默认 5，列表 20+ 封面同时加载会排队）
         val pool = okhttp3.ConnectionPool(maxIdleConnections = 20, keepAliveDuration = 5, TimeUnit.MINUTES)
@@ -145,6 +162,7 @@ class JmDirectClient(
             .retryOnConnectionFailure(true)
             .connectionPool(pool)
             .dispatcher(dispatcher)
+            .proxySelector(dynamicProxySelector)
             .cookieJar(cookieJar)
             // v27.12 关键性能修复：图片 CDN 请求自动加禁漫 header。
             // 封面 URL（/media/albums/{id}.jpg）不带 jm_sid，走 Coil 默认 HttpUriFetcher，
@@ -168,7 +186,6 @@ class JmDirectClient(
                     chain.proceed(req)
                 }
             }
-        com.jmreader.data.api.NetworkFactory.parseProxy(proxyStr)?.let { (p, _) -> b.proxy(p) }
         return b.build()
     }
 
@@ -186,7 +203,7 @@ class JmDirectClient(
         }
     }
 
-    private fun buildFastHttp(proxyStr: String?): OkHttpClient {
+    private fun buildFastHttp(): OkHttpClient {
         // v27.8：增大连接池和每域并发，配合 BaseListViewModel 滑动窗口批量补全 tags。
         // OkHttp 默认 maxRequestsPerHost=5 是 enrich 批量补全的瓶颈
         //（16 个并发 comicDetail 请求只有 5 个能同时执行，其余排队 → "一个一个加载"）。
@@ -206,37 +223,26 @@ class JmDirectClient(
             .retryOnConnectionFailure(false)
             .connectionPool(pool)
             .dispatcher(dispatcher)
+            .proxySelector(dynamicProxySelector)
             .cookieJar(cookieJar)
-        com.jmreader.data.api.NetworkFactory.parseProxy(proxyStr)?.let { (p, _) -> b.proxy(p) }
         return b.build()
     }
 
     /**
      * v27.5 #37：运行时切换代理。
-     * 重建 [http]/[fastHttp]，旧 client 的 dispatcher 线程池与连接池显式释放，
-     * 避免反复切换代理时累积泄漏的 OkHttpClient（每个 client 持有 64 线程 + 5 连接的默认池）。
-     * 同步更新 [com.jmreader.core.CoilSetup] 绑定，让后续图片加载也走新代理。
+     * API、测速和 Coil 共用动态 ProxySelector；只切换选择器状态，保留连接池和图片加载器，
+     * 避免反复切换代理时泄漏线程池或让图片继续使用旧客户端。
      */
     fun applyProxy(proxyStr: String?) {
         if (proxyStr == currentProxy) return
+        // Main, fast, test and Coil clients all use dynamicProxySelector.
+        // Only the selector state changes; connection pools and ImageLoader remain stable.
+        selectedProxy = NetworkFactory.parseProxy(proxyStr)?.first ?: Proxy.NO_PROXY
         currentProxy = proxyStr
-        // v27.5 稳定性加固：保存旧 client 引用，异步 shutdown 其线程池与连接池。
-        // 不在主线程同步 shutdown（避免阻塞 UI），交由 appScope 异步处理。
-        val oldHttp = http
-        val oldFast = fastHttp
-        http = buildMainHttp(proxyStr)
-        fastHttp = buildFastHttp(proxyStr)
-        appScope.launch {
-            runCatching {
-                oldHttp.dispatcher.executorService.shutdown()
-                oldHttp.connectionPool.evictAll()
-                oldFast.dispatcher.executorService.shutdown()
-                oldFast.connectionPool.evictAll()
-            }
-        }
-        // 同步更新 Coil 的 OkHttp 引用（ImageLoader 在启动时已构建，不会重建；
-        // 但下次 newImageLoader() 调用——如进程重启——会用新引用）。
-        runCatching { com.jmreader.core.CoilSetup.bindOkHttp(http) }
+        // Idle routes may refer to the old proxy; in-flight streams remain intact.
+        http.connectionPool.evictAll()
+        fastHttp.connectionPool.evictAll()
+        testClient.connectionPool.evictAll()
         Logger.i("JmDirect", "代理已切换: ${proxyStr ?: "直连"}")
     }
 
@@ -258,8 +264,15 @@ class JmDirectClient(
         // 关键修复：用 appScope 启动协程替代裸 Thread，遵循结构化并发（可取消、有命名、易调试）。
         // v27.3：完成后 complete warmupDeferred，让首请求最多等 3s 就能拿到最新域名池。
         appScope.launch {
-            runCatching { refreshApiDomains(forced = false) }
-            warmupDeferred.complete(Unit)
+            try {
+                refreshApiDomains(forced = false)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                Logger.w("JmDirect", "启动域名刷新失败: ${Logger.brief(e)}")
+            } finally {
+                warmupDeferred.complete(Unit)
+            }
         }
     }
 
@@ -269,24 +282,31 @@ class JmDirectClient(
      *               false=受 5 分钟节流约束（启动时主动刷新）
      * @return 是否成功更新
      */
-    private fun refreshApiDomains(forced: Boolean): Boolean {
+    private suspend fun refreshApiDomains(forced: Boolean): Boolean {
         val now = System.currentTimeMillis()
         synchronized(refreshLock) {
             // 关键修复（Bug 13）：之前 forced=true 完全无节流，断网场景下每个失败请求都会
             // 触发一次字节CDN调用（3个URL串行），放大网络压力且每个失败请求都要等3个CDN超时。
             // 现在 forced 也加 30s 节流：既保留自愈能力（30s 后可重试），又避免对字节CDN轰炸。
-            val throttleMs = if (forced) 30 * 1000L else 5 * 60 * 1000L
-            if (now - lastDomainRefreshMs < throttleMs) return false
-            // v27.3：不在这里写时间戳！之前 fetch 还没开始就打卡，
+            val successThrottleMs = if (forced) 30 * 1000L else 5 * 60 * 1000L
+            val attemptThrottleMs = if (forced) 5 * 1000L else 60 * 1000L
+            if (now - lastDomainRefreshMs < successThrottleMs) return false
+            if (now - lastDomainRefreshAttemptMs < attemptThrottleMs) return false
+            if (domainRefreshInFlight) return false
+            // 失败也记录尝试时间，避免断网时每个业务请求都额外轰炸域名服务。
+            lastDomainRefreshAttemptMs = now
+            domainRefreshInFlight = true
+            // v27.3：不在这里写成功时间戳，成功才延长 successThrottle。
             // 导致 fetch 失败后 30s 内 forced=true 也被节流拒绝，用户看到"无法拉取最新域名"。
             // 改为成功后才打卡，失败不打卡，让下次 forced=true 可立即重试。
         }
-        for (url in apiDomainServerUrls) {
-            try {
-                val req = Request.Builder().url(url).get().build()
-                // v27.3 根因 #2：用 fastHttp（10s）拉字节 CDN，避免单 URL 卡 40s
+        try {
+            for (url in apiDomainServerUrls) {
+                try {
+                    val req = Request.Builder().url(url).get().build()
+                    // v27.3 根因 #2：用 fastHttp（10s）拉字节 CDN，避免单 URL 卡 40s
                 // 字节 CDN 健康时 < 1s 返回，10s 足够；不可达时 connectRefused < 1s 即失败
-                fastHttp.newCall(req).execute().use { resp ->
+                fastHttp.executeCancellable(req).use { resp ->
                     if (!resp.isSuccessful) return@use
                     val text = resp.body?.string().orEmpty()
                     if (text.isBlank()) return@use
@@ -296,10 +316,11 @@ class JmDirectClient(
                         .mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }
                     if (list.isNotEmpty()) {
                         synchronized(apiDomains) {
+                            val preferred = apiDomains.getOrNull(domainIndex)
                             apiDomains.clear()
                             apiDomains.addAll(customApiDomains)
                             apiDomains.addAll(list.filterNot { it in customApiDomains })
-                            domainIndex = 0
+                            domainIndex = preferred?.let { apiDomains.indexOf(it) }?.coerceAtLeast(0) ?: 0
                         }
                         // v27.13：同时尝试更新图片 CDN 域名池
                         // 字节 CDN 响应可能包含 Image 字段（图片 CDN 域名列表）
@@ -322,9 +343,15 @@ class JmDirectClient(
                         return true
                     }
                 }
-            } catch (e: Throwable) {
-                Logger.w("JmDirect", "拉取最新域名失败 $url: ${Logger.brief(e)}")
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    coroutineContext.ensureActive()
+                    Logger.w("JmDirect", "拉取最新域名失败 $url: ${Logger.brief(e)}")
+                }
             }
+        } finally {
+            synchronized(refreshLock) { domainRefreshInFlight = false }
         }
         return false
     }
@@ -377,13 +404,13 @@ class JmDirectClient(
             throw RuntimeException(
                 "所有域名均请求失败: $path\n" +
                 "首轮(${errs1.size}域名全失败): ${errs1.joinToString("; ")}\n" +
-                "且无法拉取最新域名（字节CDN不可达），请检查网络连通性或配置代理。"
+                "且未能刷新域名（可能正在节流或域名服务不可达），请稍后重试或配置代理。"
             )
         }
     }
 
     /** 单轮遍历当前域名池请求；成功返回响应，全部失败返回 null。 */
-    private fun reqApiOnce(
+    private suspend fun reqApiOnce(
         path: String,
         query: Map<String, String>,
         secret: String,
@@ -415,7 +442,7 @@ class JmDirectClient(
             try {
                 // v27.3 根因 #2：用 fastHttp（10s callTimeout）轮换，避免单域名卡 40s。
                 // 成功响应通常 < 2s，10s 足够覆盖慢速但健康的域名，又能在故障域名上快速 fail。
-                fastHttp.newCall(req).execute().use { resp ->
+                fastHttp.executeCancellable(req).use { resp ->
                     if (!resp.isSuccessful) {
                         // 关键修复：HTTP 401/403 是业务错误，所有域名返回相同结果，轮换无意义。
                         // 之前对 401 也轮换 8 个域名 + 刷新 + 再轮换 8 个，最坏 16 次请求几分钟才报错。
@@ -427,7 +454,7 @@ class JmDirectClient(
                     }
                     val body = resp.body?.string().orEmpty()
                     if (body.isBlank()) throw RuntimeException("空响应")
-                    if (!decrypt) return body
+                    if (!decrypt) { selectDomain(domain); return body }
 
                     // 响应外层: {"code":200,"data":"<密文>","errorMsg":null}
                     val outer = JSONObject(body)
@@ -443,10 +470,15 @@ class JmDirectClient(
                     }
                     val data = outer.optString("data")
                     if (data.isBlank()) {
+                        selectDomain(domain)
                         return data.ifBlank { "{}" }
                     }
-                    return JMCrypto.decodeRespData(data, t)
+                    val payload = JMCrypto.decodeRespData(data, t)
+                    selectDomain(domain)
+                    return payload
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: SessionExpiredException) {
                 // 会话过期：所有域名都一样，不轮换，直接向上抛
                 Logger.w("JmDirect", "请求 $path 会话过期: ${Logger.brief(e)}")
@@ -456,6 +488,7 @@ class JmDirectClient(
                 Logger.w("JmDirect", "请求 $path 业务错误: ${Logger.brief(e)}")
                 throw e
             } catch (e: Throwable) {
+                coroutineContext.ensureActive()
                 val brief = Logger.brief(e)
                 Logger.w("JmDirect", "请求 $path @ $domain 失败: $brief")
                 errs.add("$domain: $brief")
@@ -489,12 +522,12 @@ class JmDirectClient(
             throw RuntimeException(
                 "所有域名均请求失败: POST $path\n" +
                 "首轮(${errs1.size}域名全失败): ${errs1.joinToString("; ")}\n" +
-                "且无法拉取最新域名（字节CDN不可达），请检查网络连通性或配置代理。"
+                "且未能刷新域名（可能正在节流或域名服务不可达），请稍后重试或配置代理。"
             )
         }
     }
 
-    private fun postApiOnce(path: String, form: Map<String, String>, secret: String, errs: MutableList<String>): JSONObject? {
+    private suspend fun postApiOnce(path: String, form: Map<String, String>, secret: String, errs: MutableList<String>): JSONObject? {
         val snapshot = synchronized(apiDomains) { apiDomains.toList() }
         if (snapshot.isEmpty()) return null
         var idx = synchronized(apiDomains) { domainIndex } % snapshot.size
@@ -518,7 +551,7 @@ class JmDirectClient(
 
             try {
                 // v27.3 根因 #2：POST 也用 fastHttp 短超时轮换，登录/收藏失败也能快速反馈
-                fastHttp.newCall(req).execute().use { resp ->
+                fastHttp.executeCancellable(req).use { resp ->
                     if (!resp.isSuccessful) {
                         if (resp.code == 401 || resp.code == 403) throw SessionExpiredException("HTTP ${resp.code}")
                         throw RuntimeException("HTTP ${resp.code}")
@@ -533,13 +566,18 @@ class JmDirectClient(
                         throw BusinessException("禁漫返回错误: $msg")
                     }
                     val data = outer.optString("data")
-                    return if (data.isBlank()) JSONObject("{}") else JSONObject(JMCrypto.decodeRespData(data, t))
+                    val payload = if (data.isBlank()) JSONObject("{}") else JSONObject(JMCrypto.decodeRespData(data, t))
+                    selectDomain(domain)
+                    return payload
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: SessionExpiredException) {
                 throw e
             } catch (e: BusinessException) {
                 throw e
             } catch (e: Throwable) {
+                coroutineContext.ensureActive()
                 Logger.w("JmDirect", "POST $path @ $domain 失败: ${Logger.brief(e)}")
                 errs.add("$domain: ${Logger.brief(e)}")
                 idx = (idx + 1) % snapshot.size
@@ -926,8 +964,11 @@ class JmDirectClient(
             true
         } catch (e: CancellationException) {
             throw e
+        } catch (e: SessionExpiredException) {
+            throw e
         } catch (e: Throwable) {
-            Logger.w("JmDirect", "添加收藏失败: ${Logger.brief(e)}"); false
+            Logger.w("JmDirect", "添加收藏失败: ${Logger.brief(e)}")
+            false
         }
     }
 
@@ -1010,10 +1051,12 @@ class JmDirectClient(
     fun mergeCustomDomains(custom: List<String>) {
         if (custom.isEmpty()) return
         synchronized(apiDomains) {
+            val preferred = apiDomains.getOrNull(domainIndex)
             customApiDomains.addAll(custom.filter { it.isNotBlank() })
             val merged = (customApiDomains + apiDomains).distinct()
             apiDomains.clear()
             apiDomains.addAll(merged)
+            domainIndex = preferred?.let { apiDomains.indexOf(it) }?.coerceAtLeast(0) ?: 0
         }
     }
 
@@ -1062,13 +1105,16 @@ class JmDirectClient(
      * 测速专用 client：短超时（5s），避免单个域名卡 40s 让用户等几分钟。
      * 独立于 [http]，不影响正常请求。
      */
-    private val testClient: OkHttpClient by lazy {
-        OkHttpClient.Builder()
+    @Volatile private var testClient: OkHttpClient = buildTestHttp()
+
+    private fun buildTestHttp(): OkHttpClient {
+        val builder = OkHttpClient.Builder()
             .connectTimeout(5, TimeUnit.SECONDS)
             .readTimeout(5, TimeUnit.SECONDS)
             .callTimeout(6, TimeUnit.SECONDS)
             .retryOnConnectionFailure(false)
-            .build()
+            .proxySelector(dynamicProxySelector)
+        return builder.build()
     }
 
     /**
@@ -1081,7 +1127,7 @@ class JmDirectClient(
      * 2) 即使能编译，旧版会被优先解析，testClient 形同虚设，弱网下批量测速仍卡 320s。
      * 现在合并为单一实现，统一用 testClient 短超时。
      */
-    fun testDomain(host: String): Pair<Long?, String?> {
+    suspend fun testDomain(host: String): Pair<Long?, String?> {
         val t = ts()
         val token = JMCrypto.token(t)
         val tokenparam = JMCrypto.tokenparam(t)
@@ -1103,7 +1149,7 @@ class JmDirectClient(
         return try {
             val start = System.currentTimeMillis()
             // 关键修复：用 testClient 短超时，避免单域名卡 40s。
-            testClient.newCall(req).execute().use { resp ->
+            testClient.executeCancellable(req).use { resp ->
                 val latency = System.currentTimeMillis() - start
                 if (!resp.isSuccessful) return latency to "HTTP ${resp.code}"
                 val body = resp.body?.string().orEmpty()
@@ -1118,13 +1164,18 @@ class JmDirectClient(
                 }
                 latency to null
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Throwable) {
             null to Logger.brief(e)
         }
     }
 
     /** 手动触发一次域名动态更新（界面"刷新域名"按钮用）。 */
-    suspend fun refreshDomains(): Boolean = refreshApiDomains(forced = true)
+    suspend fun refreshDomains(): Boolean =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            refreshApiDomains(forced = true)
+        }
 
     // ------------------------------------------------------------------------
     // 工具
@@ -1212,7 +1263,7 @@ class JmDirectClient(
     /** 当前图片域名（供 JmImageFetcher 拿到当前域名后自行拼装重试）。 */
     fun currentImageDomain(): String = synchronized(imageDomainLock) {
         pinnedImageCdn?.let { return it }
-        imageDomains.getOrElse(imageDomainIndex) { imageDomains[0] }
+        imageDomains.getOrElse(imageDomainIndex) { imageDomains.firstOrNull() ?: "" }
     }
 
     /**
@@ -1370,6 +1421,9 @@ private class MemoryCookieJar(context: android.content.Context) : CookieJar {
     private val store = ConcurrentHashMap<String, CookieEntry>()
 
     private data class CookieEntry(val name: String, val value: String, val expiresAt: Long)
+    // Only the site session cookie is shared across rotating API/CDN hosts.
+    // Accepting arbitrary CDN cookies can overwrite authentication state.
+    private val sharedCookieNames = setOf("AVS")
 
     init {
         runCatching {
@@ -1377,7 +1431,7 @@ private class MemoryCookieJar(context: android.content.Context) : CookieJar {
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
                 val name = o.optString("name")
-                if (name.isBlank()) continue
+                if (name.isBlank() || name !in sharedCookieNames) continue
                 store[name] = CookieEntry(name, o.optString("value"), o.optLong("expiresAt", Long.MAX_VALUE))
             }
         }
@@ -1396,7 +1450,8 @@ private class MemoryCookieJar(context: android.content.Context) : CookieJar {
     override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
         if (cookies.isEmpty()) return
         synchronized(store) {
-            cookies.forEach { c -> store[c.name] = CookieEntry(c.name, c.value, c.expiresAt) }
+            cookies.filter { it.name in sharedCookieNames }
+                .forEach { c -> store[c.name] = CookieEntry(c.name, c.value, c.expiresAt) }
             persist()
         }
     }

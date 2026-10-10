@@ -64,6 +64,17 @@ fun FavoritesScreen(container: AppContainer, navController: NavController) {
     var tab by androidx.compose.runtime.saveable.rememberSaveable { mutableIntStateOf(0) }
     val localEntriesRaw by container.favoritesStore.entries.collectAsState()
     val folders by container.favoritesStore.folders.collectAsState()
+    val readingHistory by container.historyStore.items.collectAsState()
+    val updateChecks by container.favoriteUpdatesStore.items.collectAsState()
+    var localQuery by remember { mutableStateOf("") }
+    var authorFilter by remember { mutableStateOf("") }
+    var tagFilter by remember { mutableStateOf("") }
+    var unreadOnly by remember { mutableStateOf(false) }
+    var updatedOnly by remember { mutableStateOf(false) }
+    var sortRecent by remember { mutableStateOf(false) }
+    var showBatch by remember { mutableStateOf(false) }
+    var showRandom by remember { mutableStateOf(false) }
+    var checkingUpdates by remember { mutableStateOf(false) }
     val browseHistoryRaw by container.browseHistoryStore.items.collectAsState()
     // 屏蔽规则变化时实时过滤本地收藏/浏览历史，与首页/搜索行为一致
     val rulesTriple by container.blockedTagsStore.allRules.collectAsState(
@@ -103,11 +114,11 @@ fun FavoritesScreen(container: AppContainer, navController: NavController) {
         else localEntriesRaw.filterNot { e ->
             // v27.6：优先用补全后的 tags，补全失败则用缓存的原 tags
             val tags = enrichedLocalTags[e.comic.id] ?: e.comic.tags
-            container.blockedTagsStore.isBlocked(tags, e.comic.name, e.comic.author, rules)
+            (rules.tags.isNotEmpty() && tags.isEmpty()) || container.blockedTagsStore.isBlocked(tags, e.comic.name, e.comic.author, rules)
         }
     }
     val folderCounts = remember(localEntriesRaw) { container.favoritesStore.folderCounts() }
-    val localFavorites = remember(localEntries, filterFolder) {
+    val localFavorites = remember(localEntries, filterFolder, localQuery, authorFilter, tagFilter, unreadOnly, updatedOnly, sortRecent, readingHistory, updateChecks) {
         // v27.15.2：渲染前去重（保留第一个），防御性兜底。
         // 数据层已做加载/写入去重，但保险起见 UI 层也去一次，
         // 避免任何残留重复条目导致 ComicList 的 LazyColumn key=c.id 冲突崩溃或显示数量不一致。
@@ -124,7 +135,15 @@ fun FavoritesScreen(container: AppContainer, navController: NavController) {
             val key = c.id.ifBlank { "idx_${out.size}" }
             if (seen.add(key)) out.add(c)
         }
-        out
+        val readIds = readingHistory.map { it.comic.id }.toSet()
+        val updatedIds = updateChecks.filter { it.hasUpdate }.map { it.comicId }.toSet()
+        val result = out.filter { comic ->
+            (localQuery.isBlank() || comic.name.contains(localQuery, true) || comic.id.contains(localQuery)) &&
+            (authorFilter.isBlank() || comic.author?.contains(authorFilter, true) == true) &&
+            (tagFilter.isBlank() || comic.tags.any { it.contains(tagFilter, true) }) &&
+            (!unreadOnly || comic.id !in readIds) && (!updatedOnly || comic.id in updatedIds)
+        }
+        if (sortRecent) result.sortedByDescending { c -> updateChecks.firstOrNull { it.comicId == c.id }?.checkedAt ?: 0 } else result
     }
     val browseHistory = remember(browseHistoryRaw, rules, enrichVersion) {
         if (rules.isEmpty()) browseHistoryRaw
@@ -178,6 +197,42 @@ fun FavoritesScreen(container: AppContainer, navController: NavController) {
                             )
                             // v27.5 #15：本地收藏分组过滤 chip 行
                             val folderHeader: @androidx.compose.runtime.Composable () -> Unit = {
+                                Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
+                                    OutlinedTextField(localQuery, { localQuery = it }, label = { Text("搜索收藏标题 / ID") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                                    Row {
+                                        OutlinedTextField(authorFilter, { authorFilter = it }, label = { Text("作者") }, singleLine = true, modifier = Modifier.weight(1f))
+                                        androidx.compose.foundation.layout.Spacer(Modifier.size(6.dp))
+                                        OutlinedTextField(tagFilter, { tagFilter = it }, label = { Text("标签") }, singleLine = true, modifier = Modifier.weight(1f))
+                                    }
+                                    LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        item { FilterChip(unreadOnly, { unreadOnly = !unreadOnly }, { Text("未读") }) }
+                                        item { FilterChip(updatedOnly, { updatedOnly = !updatedOnly }, { Text("有更新") }) }
+                                        item { FilterChip(sortRecent, { sortRecent = !sortRecent }, { Text("最近检查") }) }
+                                    }
+                                    Row {
+                                        TextButton(onClick = { showBatch = true }) { Text("批量管理") }
+                                        TextButton(onClick = { showRandom = true }) { Text("随机阅读") }
+                                        TextButton(enabled = !checkingUpdates, onClick = {
+                                            checkingUpdates = true
+                                            scope.launch {
+                                                var checked = 0; var failed = 0
+                                                try {
+                                                    for (comic in localEntries.filter { filterFolder == null || it.folderId == filterFolder || (filterFolder == "__none__" && it.folderId == null) }.map { it.comic }) {
+                                                        when (val detail = container.repository.comicDetail(comic.id, forceRefresh = true)) {
+                                                            is com.jmreader.data.repository.Resource.Success -> {
+                                                                container.favoriteUpdatesStore.check(comic.id, detail.data.chapters.map { it.id }.toSet()); checked++
+                                                            }
+                                                            else -> failed++
+                                                        }
+                                                    }
+                                                    onResult("已检查 $checked 本，$failed 本失败。首次检查建立章节基准。")
+                                                } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                                                catch (e: Throwable) { onResult("检查失败：${e.message}") }
+                                                finally { checkingUpdates = false }
+                                            }
+                                        }) { Text(if (checkingUpdates) "检查中…" else "检查更新") }
+                                    }
+                                }
                                 FolderFilterRow(
                                     folders = folders,
                                     folderCounts = folderCounts,
@@ -191,7 +246,7 @@ fun FavoritesScreen(container: AppContainer, navController: NavController) {
                             if (localFavorites.isEmpty()) {
                                 Column(Modifier.fillMaxSize()) {
                                     folderHeader()
-                                    EmptyBox("当前分组下没有收藏")
+                                    EmptyBox("当前分组或筛选下没有收藏")
                                 }
                             } else {
                                 ComicList(
@@ -220,6 +275,9 @@ fun FavoritesScreen(container: AppContainer, navController: NavController) {
             modifier = Modifier.align(Alignment.BottomCenter),
         )
     }
+
+    if (showBatch) FavoriteBatchDialog(container, localFavorites, { showBatch = false }, onResult)
+    if (showRandom) RandomReadingDialog(container, navController) { showRandom = false }
 
     // v27.5 #15：「管理分组」对话框
     if (showFolderManager) {
@@ -413,8 +471,15 @@ private fun BrowseHistoryTab(
                 TextButton(onClick = {
                     showClearConfirm = false
                     scope.launch {
-                        container.browseHistoryStore.clear()
-                        onResult("已清空浏览历史")
+                        try {
+                            container.browseHistoryStore.clear()
+                            onResult("已清空浏览历史")
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (e: Throwable) {
+                            com.jmreader.core.Logger.w("Favorites", "清空浏览历史失败: ${com.jmreader.core.Logger.brief(e)}")
+                            onResult("清空失败")
+                        }
                     }
                 }) { Text("清空", color = MaterialTheme.colorScheme.error) }
             },
@@ -434,6 +499,8 @@ private fun ServerFavoritesTab(
 ) {
     val vm: com.jmreader.ui.screen.favorites.ServerFavoritesViewModel =
         androidx.lifecycle.viewmodel.compose.viewModel(factory = com.jmreader.ui.screen.favorites.ServerFavoritesVMFactory(container))
+    val settings by container.settingsStore.settings.collectAsState(initial = container.settingsStore.cachedSnapshot)
+    val loggedInUser = settings.loggedInUser
     val state by vm.state.collectAsState()
     val listState = rememberLazyListState()
     // v27.5 性能修复：onClick/onViewLogs/onRetry/onLoadMore 用 remember 缓存稳定 lambda
@@ -466,7 +533,9 @@ private fun ServerFavoritesTab(
                     onRetry = onRetry,
                     onViewLogs = onNavigateLogs,
                 )
-            s.items.isEmpty() -> EmptyBox("在站点登录后可查看云端收藏")
+            s.items.isEmpty() -> EmptyBox(
+                if (loggedInUser.isNullOrBlank()) "在站点登录后可查看云端收藏" else "站点收藏为空",
+            )
             else -> ComicList(
                 items = s.items,
                 state = listState,

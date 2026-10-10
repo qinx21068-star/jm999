@@ -1,6 +1,7 @@
 package com.jmreader.data.local
 
 import android.content.Context
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringSetPreferencesKey
@@ -29,6 +30,7 @@ class BlockedTagsStore(private val context: Context) {
     private val tagKey = stringSetPreferencesKey("tags")
     private val nameKey = stringSetPreferencesKey("names")
     private val authorKey = stringSetPreferencesKey("authors")
+    private val enabledKey = booleanPreferencesKey("filter_rules_enabled_v1_3")
 
     // v27.5 稳定性加固：DataStore 文件损坏时 .catch 回退到 emptyPreferences，
     // 让下游订阅者拿到空集合而不是抛 IOException 崩溃。
@@ -48,8 +50,26 @@ class BlockedTagsStore(private val context: Context) {
     val authors: Flow<Set<String>> = safeData.map { it[authorKey] ?: emptySet() }
 
     /** tags + names + authors 合并的实时集合，供 ViewModel 监听变化触发重过滤。 */
-    val allRules: Flow<Triple<Set<String>, Set<String>, Set<String>>> =
+    val enabled: Flow<Boolean> = safeData.map { it[enabledKey] ?: true }
+    val allRules: Flow<Triple<Set<String>, Set<String>, Set<String>>> = safeData.map { prefs ->
+        if (prefs[enabledKey] == false) Triple(emptySet(), emptySet(), emptySet())
+        else Triple(prefs[tagKey].orEmpty(), prefs[nameKey].orEmpty(), prefs[authorKey].orEmpty())
+    }
+    val configuredRules: Flow<Triple<Set<String>, Set<String>, Set<String>>> =
         combine(tags, names, authors) { t, n, a -> Triple(t, n, a) }
+
+    suspend fun setEnabled(value: Boolean) = context.blockedTagsStore.edit { it[enabledKey] = value }
+
+    suspend fun importRules(rules: Triple<Set<String>, Set<String>, Set<String>>, merge: Boolean) {
+        context.blockedTagsStore.edit { prefs ->
+            val cleanTags = rules.first.filter { it.isNotBlank() }.toSet()
+            val cleanNames = rules.second.filter { it.isNotBlank() }.toSet()
+            val cleanAuthors = rules.third.filter { it.isNotBlank() }.toSet()
+            prefs[tagKey] = (if (merge) prefs[tagKey].orEmpty() else emptySet()) + cleanTags
+            prefs[nameKey] = (if (merge) prefs[nameKey].orEmpty() else emptySet()) + cleanNames
+            prefs[authorKey] = (if (merge) prefs[authorKey].orEmpty() else emptySet()) + cleanAuthors
+        }
+    }
 
     suspend fun addTag(tag: String) {
         val t = tag.trim()
@@ -117,23 +137,54 @@ class BlockedTagsStore(private val context: Context) {
         rules: NormalizedRules,
     ): Boolean {
         if (rules.isEmpty()) return false
+        if (comicTags.any { normalize(it) in rules.tags }) return true
+        if (comicName.isNotBlank() && rules.names.any { it in normalize(comicName) }) return true
+        return !comicAuthor.isNullOrBlank() && normalize(comicAuthor) in rules.authors
+    }
 
-        // tag 匹配：comic tag 归一化后与预归一化的 blocked tags 精确比对
-        if (rules.tags.isNotEmpty() && comicTags.isNotEmpty()) {
-            if (comicTags.any { normalize(it) in rules.tags }) return true
+    /**
+     * Pure rule evaluation used by the list filter and the rule tester.
+     * The returned labels identify the exact rule categories that matched; an
+     * empty list means no rule matched. It deliberately does not fetch or
+     * expose any unverified metadata, so callers can apply fail-closed policy
+     * around network enrichment.
+     */
+    fun matches(
+        comicTags: Collection<String>,
+        comicName: String,
+        comicAuthor: String?,
+        rules: NormalizedRules,
+    ): List<RuleMatch> {
+        if (rules.isEmpty()) return emptyList()
+        val matches = ArrayList<RuleMatch>(3)
+
+        if (rules.tags.isNotEmpty() && comicTags.any { normalize(it) in rules.tags }) {
+            matches += RuleMatch.TAGS
         }
-
-        // 名称关键词匹配：标题归一化后包含任一预归一化关键词即屏蔽
         if (rules.names.isNotEmpty() && comicName.isNotBlank()) {
             val normName = normalize(comicName)
-            if (rules.names.any { it in normName }) return true
+            if (rules.names.any { it in normName }) matches += RuleMatch.NAME
         }
-
-        // 作者匹配：归一化后与预归一化的 blocked authors 精确比对
         if (rules.authors.isNotEmpty() && !comicAuthor.isNullOrBlank()) {
-            if (normalize(comicAuthor) in rules.authors) return true
+            if (normalize(comicAuthor) in rules.authors) matches += RuleMatch.AUTHOR
         }
-        return false
+        return matches
+    }
+
+    /** Test UI exposes the original rule text using the same normalization as filtering. */
+    fun matchedRuleLabels(tags: List<String>, title: String, author: String?, original: Triple<Set<String>, Set<String>, Set<String>>): List<String> {
+        val tagValues = tags.map { normalize(it) }.toSet()
+        val nameValue = normalize(title)
+        val authorValue = normalize(author.orEmpty())
+        return original.first.filter { normalize(it) in tagValues }.map { "标签：$it" } +
+            original.second.filter { title.isNotBlank() && normalize(it).isNotBlank() && normalize(it) in nameValue }.map { "标题：$it" } +
+            original.third.filter { !author.isNullOrBlank() && normalize(it) == authorValue }.map { "作者：$it" }
+    }
+
+    enum class RuleMatch(val label: String) {
+        TAGS("标签规则"),
+        NAME("标题关键词"),
+        AUTHOR("作者规则"),
     }
 
     /**

@@ -53,14 +53,17 @@ class AppContainer(context: Context) {
      */
     val appScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO + CrashHandler.coroutineHandler)
 
+    val deviceConditions = com.jmreader.core.DeviceConditions(appContext, appScope)
     val settingsStore = SettingsStore(appContext, appScope)
     val blockedTagsStore = BlockedTagsStore(appContext)
     /** 漫画 tags 持久化缓存：列表接口不返回 tags，用此缓存补全用于即时屏蔽 + 卡片显示。 */
     val comicTagsCache = ComicTagsCache(appContext, appScope)
     val favoritesStore = FavoritesStore(appContext, NetworkFactory.moshi, appScope)
     val historyStore = HistoryStore(appContext, NetworkFactory.moshi, appScope)
+    val favoriteUpdatesStore = com.jmreader.data.local.FavoriteUpdatesStore(appContext, NetworkFactory.moshi, appScope)
     val browseHistoryStore = BrowseHistoryStore(appContext, NetworkFactory.moshi, appScope)
     val searchHistoryStore = SearchHistoryStore(appContext)
+    val searchTemplatesStore = com.jmreader.data.local.SearchTemplatesStore(appContext, NetworkFactory.moshi, appScope)
     /** SauceNAO 以图搜图服务（无 key 也能用，限流更严） */
     val saucenaoService = com.jmreader.data.api.saucenao.SaucenaoService()
     val downloadManager = com.jmreader.data.download.DownloadManager(appContext, this)
@@ -96,7 +99,7 @@ class AppContainer(context: Context) {
 
     /** 当用户在后端切换地址后调用，强制重建 Retrofit。 */
     suspend fun rebuildApi() {
-        val s = settingsStore.settings.first()
+        val s = settingsStore.committedSnapshot()
         val url = s.serverUrl
         // 关键修复：shutdown 旧 OkHttpClient 的连接池与 Dispatcher 线程池，
         // 避免每次切换后端地址都泄漏一个 client（含线程池/连接池），频繁切换后线程数飙升导致 OOM/ANR。
@@ -158,7 +161,7 @@ class AppContainer(context: Context) {
                 } else {
                     false to "后端返回 HTTP ${r.code()}"
                 }
-            } catch (e: Throwable) {
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Throwable) {
                 com.jmreader.core.Logger.e("App", "健康检查失败", e)
                 false to com.jmreader.core.Logger.brief(e)
             }
@@ -167,7 +170,7 @@ class AppContainer(context: Context) {
             try {
                 val r = directClient.search("", 1, "latest", "all")
                 true to "直连禁漫成功（域名: ${directClient.currentDomain()}），共 ${r.items.size} 条"
-            } catch (e: Throwable) {
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Throwable) {
                 com.jmreader.core.Logger.e("App", "直连健康检查失败", e)
                 false to "直连禁漫失败：${com.jmreader.core.Logger.brief(e)}"
             }

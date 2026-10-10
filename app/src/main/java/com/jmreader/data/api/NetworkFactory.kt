@@ -97,22 +97,22 @@ object NetworkFactory {
                 s.startsWith("socks5://", ignoreCase = true) -> {
                     val hp = s.substringAfter("socks5://").removeSuffix("/")
                     val (h, p) = splitHostPort(hp) ?: return@runCatching null
-                    Proxy(Proxy.Type.SOCKS, InetSocketAddress(h, p)) to "socks5://$h:$p"
+                    Proxy(Proxy.Type.SOCKS, InetSocketAddress.createUnresolved(h, p)) to "socks5://$h:$p"
                 }
                 s.startsWith("http://", ignoreCase = true) -> {
                     val hp = s.substringAfter("http://").removeSuffix("/")
                     val (h, p) = splitHostPort(hp) ?: return@runCatching null
-                    Proxy(Proxy.Type.HTTP, InetSocketAddress(h, p)) to "http://$h:$p"
+                    Proxy(Proxy.Type.HTTP, InetSocketAddress.createUnresolved(h, p)) to "http://$h:$p"
                 }
                 s.startsWith("https://", ignoreCase = true) -> {
                     val hp = s.substringAfter("https://").removeSuffix("/")
                     val (h, p) = splitHostPort(hp) ?: return@runCatching null
-                    Proxy(Proxy.Type.HTTP, InetSocketAddress(h, p)) to "https://$h:$p"
+                    Proxy(Proxy.Type.HTTP, InetSocketAddress.createUnresolved(h, p)) to "https://$h:$p"
                 }
                 else -> {
                     // 朴素 host:port → HTTP 代理
                     val (h, p) = splitHostPort(s) ?: return@runCatching null
-                    Proxy(Proxy.Type.HTTP, InetSocketAddress(h, p)) to "http://$h:$p"
+                    Proxy(Proxy.Type.HTTP, InetSocketAddress.createUnresolved(h, p)) to "http://$h:$p"
                 }
             }
         }.getOrNull()

@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -23,6 +24,8 @@ import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.DeleteSweep
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Pause
+import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
@@ -37,6 +40,8 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -71,6 +76,9 @@ fun DownloadsScreen(container: AppContainer, navController: NavController) {
     var deleteTarget by remember { mutableStateOf<DownloadTask?>(null) }
     // v27.5 #19 本地搜索关键词
     var searchQuery by remember { mutableStateOf("") }
+    var chapterTarget by remember { mutableStateOf<DownloadTask?>(null) }
+    var tasksLoaded by remember { mutableStateOf(false) }
+    androidx.compose.runtime.LaunchedEffect(container) { container.downloadManager.ensureLoaded(); tasksLoaded = true }
 
     // v27.5 #17 SAF 路径选择器：用户选目录后持久化 URI 权限并写入 settings
     val saFLauncher = rememberLauncherForActivityResult(
@@ -146,7 +154,7 @@ fun DownloadsScreen(container: AppContainer, navController: NavController) {
                     singleLine = true,
                 )
             }
-            if (tasks.isEmpty()) {
+            if (!tasksLoaded) { com.jmreader.ui.components.LoadingBox() } else if (tasks.isEmpty()) {
                 Box(Modifier.fillMaxSize()) {
                     EmptyBox("还没有下载任务\n在漫画详情页点击「下载」")
                 }
@@ -172,6 +180,17 @@ fun DownloadsScreen(container: AppContainer, navController: NavController) {
                         val onOpen = remember(task, navController) {
                             { navController.navigate(Routes.detail(task.comic.id)) }
                         }
+                        val onTogglePause = remember(task, container, scope, snackbar) {
+                            {
+                                val ok = if (task.status == DownloadStatus.PAUSED) {
+                                    container.downloadManager.resume(task.comic)
+                                } else {
+                                    container.downloadManager.pause(task.comic.id)
+                                }
+                                scope.launch { snackbar.showSnackbar(if (ok) (if (task.status == DownloadStatus.PAUSED) "已继续下载" else "已暂停下载") else "当前任务无法切换状态") }
+                                Unit
+                            }
+                        }
                         val onRetry = remember(task, container, scope, snackbar) {
                             {
                                 val ok = container.downloadManager.retry(task.comic)
@@ -186,12 +205,37 @@ fun DownloadsScreen(container: AppContainer, navController: NavController) {
                             task = task,
                             onOpen = onOpen,
                             onRetry = onRetry,
+                            onTogglePause = onTogglePause,
+                            onChapters = { chapterTarget = task },
+                            animations = settings.uiAnimations,
                             onDelete = onDelete,
                         )
                     }
                 }
             }
         }
+    }
+
+    chapterTarget?.let { task ->
+        AlertDialog(
+            onDismissRequest = { chapterTarget = null },
+            title = { Text("章节下载任务") },
+            text = {
+                LazyColumn(Modifier.fillMaxWidth().heightIn(max = 420.dp)) {
+                    items(container.downloadManager.chapters(task.comic.id), key = { it.id }) { chapter ->
+                        Column {
+                            Text(chapter.title.ifBlank { chapter.id })
+                            Text(if (chapter.id in tasks.firstOrNull { it.comic.id == task.comic.id }?.skippedChapterIds.orEmpty()) "已取消此章" else "纳入队列", style = MaterialTheme.typography.bodySmall)
+                            Row {
+                                TextButton(onClick = { container.downloadManager.retryChapter(task.comic.id, chapter.id) }) { Text("只补这章缺失页") }
+                                TextButton(onClick = { container.downloadManager.cancelChapter(task.comic.id, chapter.id) }) { Text("取消此章") }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { chapterTarget = null }) { Text("关闭") } },
+        )
     }
 
     if (showClearAll) {
@@ -257,6 +301,9 @@ private fun DownloadItem(
     task: DownloadTask,
     onOpen: () -> Unit,
     onRetry: () -> Unit,
+    onTogglePause: () -> Unit,
+    onChapters: () -> Unit,
+    animations: Boolean,
     onDelete: () -> Unit,
 ) {
     Card(onClick = onOpen, modifier = Modifier.fillMaxWidth()) {
@@ -274,6 +321,8 @@ private fun DownloadItem(
                 val statusText = when (task.status) {
                     DownloadStatus.QUEUED -> "等待中"
                     DownloadStatus.DOWNLOADING -> "下载中 ${task.doneChapters}/${task.totalChapters}"
+                    DownloadStatus.WAITING -> task.waitingReason ?: "等待下载条件"
+                    DownloadStatus.PAUSED -> "已暂停 ${task.doneChapters}/${task.totalChapters}"
                     DownloadStatus.COMPLETED -> "已完成 ${task.totalChapters} 章"
                     DownloadStatus.FAILED -> buildString {
                         append("下载失败")
@@ -289,13 +338,25 @@ private fun DownloadItem(
                         else -> MaterialTheme.colorScheme.onSurfaceVariant
                     },
                 )
-                if (task.status == DownloadStatus.DOWNLOADING || task.status == DownloadStatus.QUEUED) {
+                val animatedProgress by animateFloatAsState(task.progress / 100f, tween(if (animations) 160 else 0), label = "download-progress")
+                if (task.bytesPerSecond > 0) Text("约 ${task.bytesPerSecond / 1024} KB/s · 预计剩余 ${task.etaSeconds?.let { "$it 秒" } ?: "计算中"}", style = MaterialTheme.typography.bodySmall)
+                task.currentChapterTitle?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+                TextButton(onClick = onChapters) { Text("章节任务") }
+                if (task.status == DownloadStatus.DOWNLOADING || task.status == DownloadStatus.QUEUED || task.status == DownloadStatus.PAUSED || task.status == DownloadStatus.WAITING) {
                     Box(Modifier.padding(top = 6.dp)) {
                         LinearProgressIndicator(
-                            progress = { task.progress / 100f },
+                            progress = { animatedProgress },
                             modifier = Modifier.fillMaxWidth(),
                         )
                     }
+                }
+            }
+            if (task.status == DownloadStatus.DOWNLOADING || task.status == DownloadStatus.QUEUED || task.status == DownloadStatus.WAITING || task.status == DownloadStatus.PAUSED) {
+                IconButton(onClick = onTogglePause) {
+                    Icon(
+                        if (task.status == DownloadStatus.PAUSED) Icons.Outlined.PlayArrow else Icons.Outlined.Pause,
+                        contentDescription = if (task.status == DownloadStatus.PAUSED) "继续" else "暂停",
+                    )
                 }
             }
             // 失败任务显示重试按钮
