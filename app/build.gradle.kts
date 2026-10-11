@@ -29,11 +29,11 @@ android {
 
     defaultConfig {
         manifestPlaceholders["appLabel"] = "一根葱"
-        applicationId = "com.jmreader"
+        applicationId = "com.yigencong"
         minSdk = 24
         targetSdk = 36
-        versionCode = 4
-        versionName = "1.3.0"
+        versionCode = 5
+        versionName = "1.3.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
@@ -46,16 +46,17 @@ android {
         val f = rootProject.file("local.properties")
         if (f.exists()) runCatching { load(f.inputStream()) }
     }
-    val storePw = System.getenv("JM_KEYSTORE_PW") ?: localProps.getProperty("jm.keystore_pw") ?: "jmreader2024"
-    val keyPw = System.getenv("JM_KEY_PW") ?: localProps.getProperty("jm.key_pw") ?: "jmreader2024"
-    val keyAlias = System.getenv("JM_KEY_ALIAS") ?: localProps.getProperty("jm.key_alias") ?: "jmreader"
+    val storePw = System.getenv("JM_KEYSTORE_PW") ?: localProps.getProperty("jm.keystore_pw") ?: ""
+    val keyPw = System.getenv("JM_KEY_PW") ?: localProps.getProperty("jm.key_pw") ?: ""
+    val keyAlias = System.getenv("JM_KEY_ALIAS") ?: localProps.getProperty("jm.key_alias") ?: "yigencong"
 
     signingConfigs {
         create("release") {
-            // CI can build an unsigned release before the production keystore is configured.
+            // Release builds are signed with the configured Yigencong production key.
             val keystore = file("../release.keystore")
             if (keystore.exists()) {
-                storeFile = keystore
+            storeFile = keystore
+                storeType = "PKCS12"
                 storePassword = storePw
                 this.keyAlias = keyAlias
                 keyPassword = keyPw

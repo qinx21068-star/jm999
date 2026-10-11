@@ -79,7 +79,7 @@ jobs:
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: jmreader-debug-${{ github.sha }}
+          name: yigencong-debug-${{ github.sha }}
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
 
@@ -123,27 +123,31 @@ jobs:
           SDK_INSTALL_STATUS=${PIPESTATUS[1]}
           exit "$SDK_INSTALL_STATUS"
 
-      - name: Restore release keystore when configured
+      - name: Restore release keystore
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
-          if [ -n "${KEYSTORE_B64:-}" ]; then
-            echo "$KEYSTORE_B64" | base64 --decode > release.keystore
-          else
-            echo "No production keystore configured; building an unsigned release APK."
-          fi
+          set -eu
+          test -n "${KEYSTORE_B64:-}" || { echo "::error::Missing ANDROID_KEYSTORE_BASE64; configure release signing Secrets before tagging."; exit 1; }
+          echo "$KEYSTORE_B64" | base64 --decode > release.keystore
+          test -s release.keystore
 
       - name: Build release APK
         env:
           JM_KEYSTORE_PW: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           JM_KEY_PW: ${{ secrets.ANDROID_KEY_PASSWORD }}
           JM_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-        run: gradle --no-daemon :app:assembleRelease --stacktrace
+        run: |
+          set -eu
+          test -n "${JM_KEYSTORE_PW:-}" || { echo "::error::Missing ANDROID_KEYSTORE_PASSWORD"; exit 1; }
+          test -n "${JM_KEY_PW:-}" || { echo "::error::Missing ANDROID_KEY_PASSWORD"; exit 1; }
+          test -n "${JM_KEY_ALIAS:-}" || { echo "::error::Missing ANDROID_KEY_ALIAS"; exit 1; }
+          gradle --no-daemon :app:assembleRelease --stacktrace
 
       - name: Upload release APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: jmreader-release-${{ github.ref_name }}
+          name: yigencong-release-${{ github.ref_name }}
           path: app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 

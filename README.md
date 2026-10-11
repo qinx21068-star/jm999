@@ -8,6 +8,13 @@
 
 ## 📦 版本历史
 
+### v1.3.1（新包名共存版）
+
+- Android applicationId 改为 `com.yigencong`，可与旧版 `com.jmreader` 共存安装。
+- 使用新的 `yigencong` Release 签名；旧版签名材料在旧仓库和本地模板中均未找到，无法继承旧版覆盖升级。
+- 旧版没有备份功能，新版不会自动读取旧版的应用私有数据；旧版仍保留在设备上。
+- Release 构建要求 GitHub Actions 配置签名 Secrets，未配置时会停止，不发布未签名正式包。
+
 ### v1.3.0（增量升级进行中）
 
 **本轮升级**
@@ -18,6 +25,7 @@
 - 动态刷新 API 域名时保留用户自定义域名。
 - 下载路径读取最新设置，避免运行中切换目录后仍写入旧路径。
 - Release 密钥只通过 GitHub Secrets 使用，不提交到仓库。
+- 新安装包名为 `com.yigencong`，可与旧版 `com.jmreader` 共存；新版没有自动读取旧版私有数据的权限。
 
 ### v1.1.0（2026-08-09）
 
@@ -149,16 +157,15 @@ export ANDROID_HOME=/path/to/your/Android/Sdk
 #    方式 B：local.properties（首次构建自动生成，或手动创建）
 echo "sdk.dir=/path/to/your/Android/Sdk" > local.properties
 
-# 3. 生成 release 签名（仅打正式包需要，调试包可跳过）
-keytool -genkeypair -v \
-    -keystore release.keystore \
-    -alias jmreader \
-    -keyalg RSA -keysize 2048 \
-    -validity 10000 \
-    -storepass <你的密码> -keypass <你的密码> \
-    -dname "CN=JMReader, OU=Dev, O=Personal, L=Shanghai, ST=Shanghai, C=CN"
-# 项目默认期望 release.keystore 在项目根目录，alias=jmreader
-# 如使用不同的密码/别名，请修改 app/build.gradle.kts 中 signingConfigs.release
+# 3. 签名密钥
+# 已创建的新版本密钥不会提交到 Git。请将 keystore 和密码备份到密码管理器。
+# 发布 Release 前，在仓库 Settings → Secrets and variables → Actions 中保存 4 个键值：
+#   ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD,
+#   ANDROID_KEY_PASSWORD, ANDROID_KEY_ALIAS
+# Permanently back up the keystore and credentials in a password manager; losing them prevents future updates.
+# 如果你需要为另一台机器新建 keystore，可用下面命令（密码应使用密码管理器生成）：
+# keytool -genkeypair -v -keystore release.keystore -storetype PKCS12 \\
+#   -alias yigencong -keyalg RSA -keysize 4096 -validity 10000
 
 # 4. 构建 Debug APK
 ./gradlew :app:assembleDebug
