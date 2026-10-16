@@ -1227,7 +1227,7 @@ private fun ReaderSettingsScreen(
 
             SwitchRow(
                 title = "双指缩放",
-                subtitle = "阅读时支持双指缩放/双击放大图片。关闭可避免与某些手势冲突。",
+                subtitle = "双指可边缩放边移动，放大后可单指拖动；竖向到边缘继续滚动。双击放大或还原。",
                 checked = settings?.pinchZoom ?: true,
                 onCheckedChange = { vm.setPinchZoom(it) },
                 enabled = settingsLoaded,

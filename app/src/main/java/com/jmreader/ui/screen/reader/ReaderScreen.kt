@@ -9,8 +9,12 @@ import android.app.Activity
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.rememberTransformableState
-import androidx.compose.foundation.gestures.transformable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateCentroid
+import androidx.compose.foundation.gestures.calculateCentroidSize
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,9 +30,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.gestures.stopScroll
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.PagerState
@@ -70,7 +74,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -80,7 +83,8 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.activity.compose.BackHandler
-import me.saket.telephoto.zoomable.zoomable
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -447,23 +451,12 @@ fun ReaderScreen(
 
     var uiVisible by remember { mutableStateOf(true) }
     var showLineSheet by remember { mutableStateOf(false) }
-    var contentScale by remember { mutableStateOf(1f) }
-    var contentOffset by remember { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
+    var transform by remember { mutableStateOf(ReaderTransform()) }
+    val contentScale = transform.scale
     var viewportSize by remember { mutableStateOf(androidx.compose.ui.unit.IntSize.Zero) }
-    fun boundedOffset(offset: androidx.compose.ui.geometry.Offset, scale: Float): androidx.compose.ui.geometry.Offset {
-        val limitX = viewportSize.width * (scale - 1f) / 2f
-        val limitY = viewportSize.height * (scale - 1f) / 2f
-        return androidx.compose.ui.geometry.Offset(offset.x.coerceIn(-limitX, limitX), offset.y.coerceIn(-limitY, limitY))
-    }
-    val transformState = rememberTransformableState { zoomChange, panChange, _ ->
-        val nextScale = (contentScale * zoomChange).coerceIn(1f, 4f)
-        contentScale = nextScale
-        contentOffset = if (nextScale <= 1f) androidx.compose.ui.geometry.Offset.Zero
-            else boundedOffset(contentOffset + panChange, nextScale)
-    }
-    LaunchedEffect(state.imageFiles, pinchZoom) {
-        contentScale = 1f
-        contentOffset = androidx.compose.ui.geometry.Offset.Zero
+    var transforming by remember { mutableStateOf(false) }
+    LaunchedEffect(state.imageFiles, pinchZoom, direction) {
+        transform = ReaderTransform()
     }
     // 阅读进度恢复提示：进入章节自动滚到上次位置后，弹 snackbar 告知用户
     val jumpSnackbar = remember { androidx.compose.material3.SnackbarHostState() }
@@ -677,27 +670,61 @@ fun ReaderScreen(
         },
     ) { inner ->
         Box(
-            Modifier
-                .fillMaxSize()
-                .padding(inner)
-                .clipToBounds()
+            Modifier.fillMaxSize().padding(inner).clipToBounds().background(Color.Black)
                 .onSizeChanged {
                     viewportSize = it
-                    contentOffset = boundedOffset(contentOffset, contentScale)
+                    transform = transform.copy(offset = boundReaderOffset(transform.offset, transform.scale, it))
                 }
-                .transformable(
-                    state = transformState,
-                    enabled = pinchZoom,
-                    canPan = { contentScale > 1f },
-                )
-                .background(Color.Black)
-                .graphicsLayer {
-                    scaleX = contentScale
-                    scaleY = contentScale
-                    translationX = contentOffset.x
-                    translationY = contentOffset.y
+                .pointerInput(pinchZoom, direction, state.imageFiles) {
+                    if (!pinchZoom) return@pointerInput
+                    awaitEachGesture {
+                        awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                        var owned = false
+                        var zoomMotion = 1f
+                        var panMotion = Offset.Zero
+                        try {
+                            do {
+                                val event = awaitPointerEvent(PointerEventPass.Initial)
+                                val count = event.changes.count { it.pressed }
+                                val zoom = event.calculateZoom()
+                                val pan = event.calculatePan()
+                                if (!owned && (count >= 2 || transform.scale > 1.001f)) {
+                                    zoomMotion *= zoom
+                                    panMotion += pan
+                                    val zoomDistance = kotlin.math.abs(1f - zoomMotion) * event.calculateCentroidSize(useCurrent = false)
+                                    owned = zoomDistance > viewConfiguration.touchSlop || panMotion.getDistance() > viewConfiguration.touchSlop
+                                }
+                                if (owned) {
+                                    if (!transforming) {
+                                        transforming = true
+                                        jumpScope.launch {
+                                            verticalListState.stopScroll()
+                                            horizontalPagerState.stopScroll()
+                                        }
+                                    }
+                                    val focus = event.calculateCentroid(useCurrent = false)
+                                    if (focus != Offset.Unspecified) {
+                                        val delta = transformReader(transform, zoom, pan, focus, viewportSize)
+                                        transform = delta.transform
+                                        if (direction == ReaderDirection.VERTICAL && delta.remainingPan.y != 0f) {
+                                            verticalListState.dispatchRawDelta(-delta.remainingPan.y / transform.scale)
+                                        }
+                                    }
+                                    event.changes.forEach { it.consume() }
+                                }
+                            } while (event.changes.any { it.pressed })
+                        } finally {
+                            transforming = false
+                        }
+                    }
                 },
         ) {
+            Box(Modifier.fillMaxSize().graphicsLayer {
+                scaleX = transform.scale
+                scaleY = transform.scale
+                translationX = transform.offset.x
+                translationY = transform.offset.y
+            }) {
             // v27.5 稳定性加固：捕获 state 到本地 val，避免 `state.error != null` 通过后
             // 在另一线程写 StateFlow 时 state.error 变 null，下一行 `state.error!!` 抛 NPE。
             // collectAsState 的 by 委托每次访问都读最新 snapshot，单次 composition 内不保证一致。
@@ -761,10 +788,15 @@ fun ReaderScreen(
                         onPageChanged = onPageChanged,
                         onTap = onTap,
                         onJumpNotice = onJumpNotice,
-                        // v27.5 #1 #3 #5
-                        pinchZoom = false,
+                        onDoubleTap = {
+                            if (pinchZoom) transform = if (transform.scale > 1.001f) ReaderTransform()
+                                else transformReader(transform, 2f, Offset.Zero,
+                                    Offset(viewportSize.width / 2f, viewportSize.height / 2f), viewportSize).transform
+                            else onTap()
+                        },
+                        userScrollEnabled = !transforming && contentScale <= 1.001f,
                         tapZoneMode = if (contentScale > 1f) TapZoneMode.DISABLED else tapZoneMode,
-                        autoScroll = autoScroll && contentScale <= 1f,
+                        autoScroll = autoScroll && contentScale <= 1.001f && !transforming,
                         autoScrollSpeed = autoScrollSpeed,
                         onZoneTap = { delta ->
                             // 横向阅读时点击区域翻页：delta=-1 上一页，+1 下一页
@@ -778,6 +810,7 @@ fun ReaderScreen(
                     )
                 }
             }
+            } // transformed reading content
             // v27.5 #5：夜间护眼滤镜叠加层（暖色半透明黄/橙色）。
             // 放在 Box 内最上层覆盖所有 reader 内容（loading/error/正常），
             // 不消费点击事件（pointerInput 不拦截），仅做颜色叠加。
@@ -810,9 +843,9 @@ private fun ReaderPager(
     horizontalPagerState: PagerState,
     onPageChanged: (Int) -> Unit,
     onTap: () -> Unit,
+    onDoubleTap: () -> Unit = {},
+    userScrollEnabled: Boolean = true,
     onJumpNotice: (Int) -> Unit = {},
-    // v27.5 新增
-    pinchZoom: Boolean = true,
     tapZoneMode: TapZoneMode = TapZoneMode.THIRD_THIRD,
     autoScroll: Boolean = false,
     autoScrollSpeed: Float = 5f,
@@ -858,8 +891,9 @@ private fun ReaderPager(
             listState = verticalListState,
             onPageChanged = onPageChanged,
             onTap = onTap,
+            onDoubleTap = onDoubleTap,
+            userScrollEnabled = userScrollEnabled,
             onJumpNotice = onJumpNotice,
-            pinchZoom = false,
             autoScroll = autoScroll,
             autoScrollSpeed = autoScrollSpeed,
             readerFontSize = readerFontSize,
@@ -873,9 +907,10 @@ private fun ReaderPager(
                 pagerState = horizontalPagerState,
                 onPageChanged = onPageChanged,
                 onTap = onTap,
+                onDoubleTap = onDoubleTap,
+                userScrollEnabled = userScrollEnabled,
                 onJumpNotice = onJumpNotice,
                 reverse = direction == ReaderDirection.HORIZONTAL_RL,
-                pinchZoom = false,
                 tapZoneMode = tapZoneMode,
                 onZoneTap = onZoneTap,
                 readerFontSize = readerFontSize,
@@ -892,8 +927,9 @@ private fun VerticalReader(
     listState: LazyListState,
     onPageChanged: (Int) -> Unit,
     onTap: () -> Unit,
+    onDoubleTap: () -> Unit = {},
+    userScrollEnabled: Boolean = true,
     onJumpNotice: (Int) -> Unit = {},
-    pinchZoom: Boolean = true,
     autoScroll: Boolean = false,
     autoScrollSpeed: Float = 5f,
     readerFontSize: Float = 16f,
@@ -916,9 +952,7 @@ private fun VerticalReader(
             .collect { onPageChanged(it) }
     }
     // v27.5 #8：自动滚动。每帧推进 px = speed * dt（按真实帧间隔，跟随系统刷新率）。
-    // 用户手动滑动时 listState.scrollBy 仍可工作，但 telephoto zoomable 在缩放后会消费手势，
-    // 这里是独立 LaunchedEffect，与用户手势并存：若用户暂停手指则会继续自动滚。
-    // isUserScrolling 检测：用户正在拖动时短暂跳过一帧避免冲突。
+    // 变换手势期间暂停自动滚动，避免后台滚动与手指平移相互竞争。
     if (autoScroll && images.isNotEmpty()) {
         LaunchedEffect(autoScroll, autoScrollSpeed, listState) {
             // 等 600ms 再开始，避免与 initialPage 恢复滚动冲突
@@ -942,16 +976,15 @@ private fun VerticalReader(
     }
     LazyColumn(
         state = listState,
+        userScrollEnabled = userScrollEnabled,
         modifier = Modifier.fillMaxSize().background(Color.Black),
         contentPadding = PaddingValues(vertical = 4.dp),
     ) {
         // v27.5 稳定性加固：用 itemsIndexed + 复合 key，避免图片路径重复时
         // LazyColumn 抛 IllegalArgumentException: Key "xxx" was already used 崩溃
         itemsIndexed(images, key = { i, p -> "$i:$p" }) { _, path ->
-            // 竖向滚动也用 telephoto zoomable：支持双指缩放 + 放大后拖拽平移。
-            // telephoto 在未缩放（1x）时让滑动手势透传给 LazyColumn，缩放后消费拖拽做平移，
-            // 不影响正常上下翻页。
-            ReaderImage(path = path, onTap = onTap, pinchZoom = pinchZoom, modifier = Modifier.fillMaxWidth(), readerFontSize = readerFontSize, readerLineSpacing = readerLineSpacing, imageQuality = imageQuality)
+            // 图像只处理点击；缩放和平移由外层视口统一处理。
+            ReaderImage(path = path, onTap = onTap, onDoubleTap = onDoubleTap, modifier = Modifier.fillMaxWidth(), readerFontSize = readerFontSize, readerLineSpacing = readerLineSpacing, imageQuality = imageQuality)
         }
     }
 }
@@ -963,9 +996,10 @@ private fun HorizontalReader(
     pagerState: PagerState,
     onPageChanged: (Int) -> Unit,
     onTap: () -> Unit,
+    onDoubleTap: () -> Unit = {},
+    userScrollEnabled: Boolean = true,
     onJumpNotice: (Int) -> Unit = {},
     reverse: Boolean = false,
-    pinchZoom: Boolean = true,
     tapZoneMode: TapZoneMode = TapZoneMode.THIRD_THIRD,
     onZoneTap: (Int) -> Unit = {},
     readerFontSize: Float = 16f,
@@ -990,17 +1024,16 @@ private fun HorizontalReader(
     // v27.5 #7：点击区域翻页（仅 HORIZONTAL 模式）。
     // - THIRD_THIRD：左 1/3 = 上一页，中 1/3 = 切换 UI，右 1/3 = 下一页
     // - LEFT_RIGHT：左半 = 上一页，右半 = 下一页（中无 UI 切换，靠长按或菜单）
-    // - DISABLED：纯 zoomable onClick 切换 UI
+    // - DISABLED：图片单击只切换控制栏
     // 注意：RL 方向时左/右语义翻转——左→下一页、右→上一页，符合右→左阅读直觉。
-    var pagerWidthPx: Int by remember { mutableStateOf(0) }
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black)
-            .onGloballyPositioned { pagerWidthPx = it.size.width },
+            .background(Color.Black),
     ) {
         HorizontalPager(
             state = pagerState,
+            userScrollEnabled = userScrollEnabled,
             modifier = Modifier.fillMaxSize(),
             reverseLayout = reverse,
             beyondViewportPageCount = 1,
@@ -1009,69 +1042,24 @@ private fun HorizontalReader(
         ) { page ->
             // 越界保护：page 理论上不会越界，但加保护避免极端情况闪退
             val path = images.getOrNull(page) ?: return@HorizontalPager
-            ReaderImage(path = path, onTap = onTap, pinchZoom = pinchZoom, modifier = Modifier.fillMaxSize(), readerFontSize = readerFontSize, readerLineSpacing = readerLineSpacing, imageQuality = imageQuality)
+            ReaderImage(path = path, onTap = onTap, onDoubleTap = onDoubleTap,
+                onTapPosition = { fraction ->
+                    val delta = readerTapDelta(fraction, tapZoneMode, reverse)
+                    if (delta == 0 || images.size <= 1) onTap() else onZoneTap(delta)
+                }, modifier = Modifier.fillMaxSize(), readerFontSize = readerFontSize, readerLineSpacing = readerLineSpacing, imageQuality = imageQuality)
         }
-        // 点击区域覆盖层：拦截单击，缩放/拖拽由 zoomable 在下层处理
-        if (tapZoneMode != TapZoneMode.DISABLED && pagerWidthPx > 0 && images.size > 1) {
-            val w = pagerWidthPx
-            val third = w / 3
-            // 左 1/3 / 右 1/3 区
-            // v27.5 稳定性加固（high 修复）：pointerInput key 必须含 images.size。
-            // 之前 key 只有 (tapZoneMode, reverse, w)，切章后这些不变 → pointerInput 块不重启，
-            // 内部 onZoneTap 仍捕获旧的 jumpToPage → 旧的 totalPages。从 10 页章节切到 5 页章节后，
-            // 翻第 4 页点右 1/3 区域 jumpToPage(4+1)，旧 totalPages=10 把它 clamp 到 5，越界跳页。
-            // 加入 images.size 作为 key：切章时 size 变化 → pointerInput 重启 → 捕获新的 onZoneTap/totalPages。
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .pointerInput(tapZoneMode, reverse, w, images.size) {
-                        detectTapGestures(
-                            onTap = { offset ->
-                                val x = offset.x.toInt()
-                                val delta = when (tapZoneMode) {
-                                    TapZoneMode.THIRD_THIRD -> when {
-                                        x < third -> -1
-                                        x > w - third -> 1
-                                        else -> 0 // 中间区：切换 UI
-                                    }
-                                    TapZoneMode.LEFT_RIGHT -> if (x < w / 2) -1 else 1
-                                    TapZoneMode.DISABLED -> 0
-                                }
-                                if (delta == 0) {
-                                    onTap()
-                                } else {
-                                    // RL 方向：左右翻页语义翻转
-                                    onZoneTap(if (reverse) -delta else delta)
-                                }
-                            },
-                        )
-                    },
-            )
-        }
+
     }
 }
 
-/**
- * 单张阅读图片：远程 URL 或本地文件。
- *
- * 统一用 AsyncImage + telephoto zoomable 修饰符，竖滑/横滑模式共用同一套逻辑：
- * - 双指缩放（pinch-to-zoom），maxZoomFactor=5f，可自由放大
- * - 放大后拖拽平移查看细节（telephoto 自动处理与 LazyColumn/Pager 的手势冲突）
- * - 双击在 1x/maxZoom 间切换
- * - 单击切换顶/底栏显隐（通过 zoomable 的 onClick 回调，避免 pointerInput 冲突）
- *
- * 之前横滑用 ZoomableAsyncImage 出现全黑：该组件与 JmImageFetcher 的 SourceResult
- * 配合时有渲染问题。改用 AsyncImage + zoomable 修饰符分离图片加载与缩放逻辑，更可靠。
- * 本地文件（已下载）也走同一路径，AsyncImage 对 File model 有原生支持。
- */
+/** Async image loading and taps; viewport owns all zoom/pan gestures, retry stays a child button. */
 @Composable
 private fun ReaderImage(
     path: String,
     onTap: () -> Unit,
+    onDoubleTap: () -> Unit = {},
+    onTapPosition: ((Float) -> Unit)? = null,
     modifier: Modifier = Modifier,
-    // v27.5 #1：双指缩放开关。关闭时 maxZoomFactor=1f，等价于禁用缩放，
-    // telephoto 仍保留 onClick 单击回调用于切换 UI。
-    pinchZoom: Boolean = true,
     // v27.6：阅读器文字大小/行距设置，应用到错误提示文本
     readerFontSize: Float = 16f,
     readerLineSpacing: Float = 1.5f,
@@ -1119,33 +1107,22 @@ private fun ReaderImage(
     var imgState by remember(path) {
         mutableStateOf<coil.compose.AsyncImagePainter.State>(coil.compose.AsyncImagePainter.State.Empty)
     }
-    // v27.5 卡顿修复：pinchZoom=false 时不挂 telephoto zoomable——
-    // 之前即使 maxZoomFactor=1f，每个 reader item 仍注册完整手势检测器 + graphicsLayer，
-    // 满屏 20-30 张图每帧重算 transforms，是阅读器滑动卡顿主因之一。
-    // v27.5 稳定性加固：补全 onDoubleTap / onLongPress，避免用户感知"卡死"。
-    // 关闭缩放时仅用 pointerInput + detectTapGestures 处理单击切 UI，开销几乎为零。
-    val imageModifier = if (pinchZoom) {
-        val zoomState = me.saket.telephoto.zoomable.rememberZoomableState(
-            zoomSpec = me.saket.telephoto.zoomable.ZoomSpec(maxZoomFactor = 5f)
-        )
-        Modifier
-            .fillMaxWidth()
-            .zoomable(
-                state = zoomState,
-                onClick = { onTap() },
+    // One unscaled viewport owns transforms; image taps never sit above the retry controls.
+    val currentTap by androidx.compose.runtime.rememberUpdatedState(onTap)
+    val currentDoubleTap by androidx.compose.runtime.rememberUpdatedState(onDoubleTap)
+    val currentPositionTap by androidx.compose.runtime.rememberUpdatedState(onTapPosition)
+    val imageModifier = Modifier.fillMaxWidth()
+    Box(modifier = modifier.background(Color(0xFF1A1A1A))
+        .pointerInput(path) {
+            detectTapGestures(
+                onTap = { position ->
+                    val action = currentPositionTap
+                    if (action == null) currentTap() else action(position.x / size.width.coerceAtLeast(1))
+                },
+                onDoubleTap = { currentDoubleTap() },
+                onLongPress = { currentTap() },
             )
-    } else {
-        Modifier
-            .fillMaxWidth()
-            .pointerInput(Unit) {
-                detectTapGestures(
-                    onTap = { onTap() },
-                    onDoubleTap = { /* 双击也切 UI，与单击等价；不做缩放 */ onTap() },
-                    onLongPress = { /* 长按也切 UI，避免用户长按无响应误判卡死 */ onTap() },
-                )
-            }
-    }
-    Box(modifier = modifier.background(Color(0xFF1A1A1A)), contentAlignment = Alignment.Center) {
+        }, contentAlignment = Alignment.Center) {
         androidx.compose.runtime.key(path, imageQuality, retryNonce) {
         coil.compose.AsyncImage(
             model = model,
