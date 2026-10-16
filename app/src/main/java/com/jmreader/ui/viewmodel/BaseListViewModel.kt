@@ -46,6 +46,8 @@ data class ListUiState(
     val items: List<ComicBriefDto> = emptyList(),
     val page: Int = 1,
     val total: Int? = null,
+    /** Raw item count loaded before blocking/filtering. */
+    val loadedCount: Int = 0,
     val error: String? = null,
     val endReached: Boolean = false,
     /** 有 tag 规则且部分条目未补全 tags（持回中）。UI 可显示"正在过滤…"。 */
@@ -67,6 +69,7 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
      *  v27.12：@Volatile。enrich 在 Dispatchers.Default 上写，setScrolling/refresh 等在 Main 上读，
      *  字段引用必须可见一致。List 自身的不可变性保证读到的快照可用。 */
     @Volatile private var rawItems: List<ComicBriefDto> = emptyList()
+    @Volatile private var listGeneration = 0L
 
     /**
      * v27.13 竞态根因修复：enrich 不再持有 rawMutable 快照。
@@ -79,24 +82,36 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
      * 刷新 UI 时用 [mergeEnriched] 从 enrichedDetailCache 合并到最新 rawItems。
      * loadMore/refresh 改 rawItems 不影响 enrich，enrich 结果永不丢失。
      */
+    private fun mergeMetadata(base: ComicBriefDto, detail: ComicBriefDto): ComicBriefDto = base.copy(
+        name = detail.name.takeIf { it.isNotBlank() } ?: base.name,
+        author = detail.author?.takeIf { it.isNotBlank() } ?: base.author,
+        tags = detail.tags.ifEmpty { base.tags },
+        cover = detail.cover?.takeIf { it.isNotBlank() } ?: base.cover,
+        likes = detail.likes?.takeIf { it.isNotBlank() } ?: base.likes,
+        views = detail.views?.takeIf { it.isNotBlank() } ?: base.views,
+        page_count = detail.page_count ?: base.page_count,
+        publishTime = detail.publishTime?.takeIf { it.isNotBlank() } ?: base.publishTime,
+    )
+
     private fun mergeEnriched(source: List<ComicBriefDto>): List<ComicBriefDto> {
         if (enrichedDetailCache.isEmpty()) return source
         var changed = false
-        val result = source.map { c ->
-            val enriched = enrichedDetailCache[c.id]
-            if (enriched != null && enriched != c) {
-                changed = true
-                enriched
-            } else {
-                c
-            }
+        val result = source.map { base ->
+            val detail = enrichedDetailCache[base.id]
+            if (detail != null) {
+                val merged = mergeMetadata(base, detail)
+                if (merged != base) changed = true
+                merged
+            } else base
         }
         return if (changed) result else source
     }
 
     /** 已补全 tags 的 albumId 集合，避免重复请求 /album。
      *  v27.12：改为线程安全集合，enrich（Default）与 setScrolling（Main）并发读写。 */
+    /** Tags are sufficient for fail-closed tag filtering; distinct from full card metadata completeness. */
     private val enrichedIds: MutableSet<String> = java.util.Collections.synchronizedSet(HashSet())
+    private val metadataCompleteIds: MutableSet<String> = java.util.Collections.synchronizedSet(HashSet())
 
     /** 已补全的完整字段缓存（id → ComicBriefDto），refresh 后回填 tags/likes/views/publishTime。
      *  v27.12：改为线程安全 Map，enrich（Default）与 refresh（Main）并发访问。 */
@@ -161,6 +176,11 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
      */
     private fun currentDataSource(): List<ComicBriefDto> = mergeEnriched(rawItems)
 
+    private fun needsEnrichment(comic: ComicBriefDto): Boolean =
+        comic.id.isNotBlank() &&
+            (comic.id !in metadataCompleteIds || (hasTagRules && comic.id !in enrichedIds)) &&
+            (enrichAttempts[comic.id] ?: 0) < MAX_ENRICH_ATTEMPTS
+
     private fun hasPendingEnrichment(items: List<ComicBriefDto>): Boolean =
         hasTagRules && items.any { comic ->
             comic.id.isNotBlank() && comic.id !in enrichedIds &&
@@ -172,20 +192,18 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
      * 必须在 [Dispatchers.Default] 上调用（applyBlock 内有大量繁简转换）。
      */
     private suspend fun refreshUiStateFromRaw() {
+        val generation = listGeneration
         val (tags, names, authors) = currentRules()
         val rules = container.blockedTagsStore.normalizeRules(tags, names, authors)
         val snapshot = currentDataSource()
         val (filtered, coverHidden) = applyBlock(snapshot, rules, blockMode)
         val stillPending = hasPendingEnrichment(snapshot)
-        // _state.value 是线程安全的，可在任意线程写
-        if (filtered != _state.value.items || stillPending != _state.value.filtering ||
-            coverHidden != _state.value.coverHiddenIds
-        ) {
-            _state.value = _state.value.copy(
-                items = filtered,
-                filtering = stillPending,
-                coverHiddenIds = coverHidden,
-            )
+        withContext(Dispatchers.Main.immediate) {
+            if (generation != listGeneration) return@withContext
+            val current = _state.value
+            if (filtered != current.items || stillPending != current.filtering || coverHidden != current.coverHiddenIds) {
+                _state.value = current.copy(items = filtered, filtering = stillPending, coverHiddenIds = coverHidden)
+            }
         }
     }
 
@@ -206,22 +224,10 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
                     // 去重：归一化后的规则集合内容相同则跳过（combine 多次 emit 同一结果）
                     if (rules == lastRules) return@collect
                     lastRules = rules
+                    listGeneration++
                     hasTagRules = rules.tags.isNotEmpty()
                     if (rawItems.isNotEmpty()) {
-                        withContext(Dispatchers.Default) {
-                            val src = currentDataSource()
-                            val (filtered, coverHidden) = applyBlock(src, rules, blockMode)
-                            val stillPending = hasPendingEnrichment(src)
-                            if (filtered != _state.value.items || stillPending != _state.value.filtering ||
-                                coverHidden != _state.value.coverHiddenIds
-                            ) {
-                                _state.value = _state.value.copy(
-                                    items = filtered,
-                                    filtering = stillPending,
-                                    coverHiddenIds = coverHidden,
-                                )
-                            }
-                        }
+                        withContext(Dispatchers.Default) { refreshUiStateFromRaw() }
                         // 规则变化可能需要重新 enrich（新增 tag 规则时之前未持回的条目现在需要补全）
                         enrichTagsInBackground()
                     }
@@ -237,6 +243,7 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
         viewModelScope.launch {
             container.settingsStore.settings.collect { s ->
                 if (s.blockMode != blockMode) {
+                    listGeneration++
                     blockMode = s.blockMode
                     if (rawItems.isNotEmpty()) {
                         withContext(Dispatchers.Default) { refreshUiStateFromRaw() }
@@ -248,6 +255,8 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
 
     /** 子类提供分页加载逻辑。返回 (items, total)。 */
     protected abstract suspend fun loadPage(page: Int): Resource<Pair<List<ComicBriefDto>, Int?>>
+
+    protected open fun isTerminalPage(page: Int): Boolean = false
 
     /** 当前 loadMore 的 Job，新 loadMore 启动前取消旧的，避免并发竞态重复加载同一页。 */
     private var loadMoreJob: Job? = null
@@ -264,6 +273,19 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
         loadMoreJob?.cancel()
         enrichJob?.cancel()
         enrichDebounceJob?.cancel()
+    }
+
+    /** Clear the raw source too, otherwise a rule update can repopulate an empty search. */
+    protected fun clearList() {
+        cancelAllLoadingJobs()
+        listGeneration++
+        rawItems = emptyList()
+        enrichedDetailCache.clear()
+        enrichedIds.clear()
+        metadataCompleteIds.clear()
+        enrichAttempts.clear()
+        enrichDirty = false
+        _state.value = ListUiState()
     }
 
     /**
@@ -286,15 +308,18 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
         // 详情接口返回的就是真实 tags，全部标记为已补全 + 写缓存
         val newIds = items.mapTo(HashSet(items.size)) { it.id }
         enrichedIds.retainAll(newIds)
+        metadataCompleteIds.retainAll(newIds)
         enrichedDetailCache.keys.retainAll(newIds)
         enrichAttempts.clear()
-        items.forEach { c ->
-            if (c.id.isNotEmpty() && c.tags.isNotEmpty()) {
-                enrichedIds.add(c.id)
-                enrichedDetailCache[c.id] = c
-                container.comicTagsCache.put(c.id, c.tags)
+        items.forEach { comic ->
+            if (comic.id.isNotEmpty()) {
+                if (isTagComplete(comic)) enrichedIds.add(comic.id)
+                if (isMetadataComplete(comic)) metadataCompleteIds.add(comic.id)
+                enrichedDetailCache[comic.id] = mergeMetadata(enrichedDetailCache[comic.id] ?: comic, comic)
+                if (comic.tags.isNotEmpty()) container.comicTagsCache.put(comic.id, comic.tags)
             }
         }
+        listGeneration++
         rawItems = items
         val (tags, names, authors) = currentRules()
         val rules = container.blockedTagsStore.normalizeRules(tags, names, authors)
@@ -307,13 +332,62 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
             items = filtered,
             page = 1,
             total = totalForState,
+            loadedCount = items.size,
             refreshing = false,
             loadingMore = false,
             endReached = true, // 批量结果无分页
             error = null,
-            filtering = false,
+            filtering = hasPendingEnrichment(rawItems),
             coverHiddenIds = coverHidden,
         )
+        enrichTagsInBackground()
+    }
+
+    /** Replace the current remote batch (used by explicit search page navigation). */
+    protected suspend fun replacePageResult(
+        page: Int,
+        items: List<ComicBriefDto>,
+        total: Int?,
+        endReached: Boolean,
+        loadedCountForState: Int? = null,
+    ) {
+        cancelAllLoadingJobs()
+        container.comicTagsCache.ensureLoaded()
+        val ids = items.mapTo(HashSet(items.size)) { it.id }
+        enrichedIds.retainAll(ids)
+        metadataCompleteIds.retainAll(ids)
+        enrichedDetailCache.keys.retainAll(ids)
+        enrichAttempts.clear()
+        listGeneration++
+        rawItems = items.map { comic ->
+            val cachedTags = container.comicTagsCache.get(comic.id)
+            val withTags = if (cachedTags != null && comic.tags.isEmpty()) comic.copy(tags = cachedTags) else comic
+            enrichedDetailCache[comic.id]?.let { mergeMetadata(withTags, it) } ?: withTags
+        }
+        rawItems.forEach { comic ->
+            if (isTagComplete(comic)) enrichedIds.add(comic.id)
+            if (isMetadataComplete(comic)) metadataCompleteIds.add(comic.id)
+        }
+        val (tags, names, authors) = currentRules()
+        val rules = container.blockedTagsStore.normalizeRules(tags, names, authors)
+        hasTagRules = rules.tags.isNotEmpty()
+        val source = mergeEnriched(rawItems)
+        val (filtered, coverHidden) = withContext(Dispatchers.Default) {
+            applyBlock(source, rules, blockMode)
+        }
+        _state.value = _state.value.copy(
+            items = filtered,
+            page = page,
+            total = total,
+            loadedCount = loadedCountForState ?: rawItems.size,
+            refreshing = false,
+            loadingMore = false,
+            endReached = endReached,
+            error = null,
+            filtering = hasPendingEnrichment(rawItems),
+            coverHiddenIds = coverHidden,
+        )
+        enrichTagsInBackground()
     }
 
     fun refresh() {
@@ -326,7 +400,7 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
         enrichJob?.cancel()
         enrichDebounceJob?.cancel()
         refreshJob = viewModelScope.launch {
-            _state.value = _state.value.copy(refreshing = true, error = null, page = 1, endReached = false)
+            _state.value = _state.value.copy(refreshing = true, error = null, page = 1, loadedCount = 0, endReached = false)
             try {
                 when (val r = loadPage(1)) {
                     is Resource.Success -> {
@@ -335,34 +409,27 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
                         // 确保持久化 tags 缓存已加载（首次启动时懒加载）
                         container.comicTagsCache.ensureLoaded()
                         // 用持久化缓存 + 已 enrich 缓存回填 tags，让缓存命中的条目即时屏蔽
-                        rawItems = items.map { c ->
-                            val enriched = enrichedDetailCache[c.id]
-                            if (enriched != null) {
-                                enriched
-                            } else {
-                                val cachedTags = container.comicTagsCache.get(c.id)
-                                if (cachedTags != null && c.tags.isEmpty()) {
-                                    c.copy(tags = cachedTags)
-                                } else {
-                                    c
-                                }
-                            }
+                        listGeneration++
+                        rawItems = items.map { comic ->
+                            val cachedTags = container.comicTagsCache.get(comic.id)
+                            val withTags = if (cachedTags != null && comic.tags.isEmpty()) comic.copy(tags = cachedTags) else comic
+                            enrichedDetailCache[comic.id]?.let { mergeMetadata(withTags, it) } ?: withTags
                         }
-                        // 缓存命中的条目标记为已补全（无需再 enrich）
-                        rawItems.forEach { c ->
-                            if (c.tags.isNotEmpty() && c.id !in enrichedIds) {
-                                enrichedIds.add(c.id)
-                                enrichedDetailCache[c.id] = c
-                            }
+                        // 只有详情元数据完整时才标记 enrich 完成。
+                        // tags 缓存只代表标签已知，不能阻止后续补全作者/发布时间。
+                        rawItems.forEach { comic ->
+                            if (isTagComplete(comic)) enrichedIds.add(comic.id)
+                            if (isMetadataComplete(comic)) metadataCompleteIds.add(comic.id)
                         }
                         // v27.13 诊断：缓存命中数 vs 待 enrich 数
                         val cachedCount = rawItems.count { it.tags.isNotEmpty() }
                         Logger.i("List", "refresh tags: $cachedCount/${rawItems.size} 已有tags, ${rawItems.size - cachedCount} 待enrich")
                         val newIds = items.mapTo(HashSet(items.size)) { it.id }
                         enrichedIds.retainAll(newIds)
+                        metadataCompleteIds.retainAll(newIds)
                         enrichedDetailCache.keys.retainAll(newIds)
                         enrichAttempts.clear()
-                        val reached = items.isEmpty() || (total != null && rawItems.size >= total)
+                        val reached = isTerminalPage(1) || items.isEmpty() || (total != null && rawItems.size >= total)
                         val (tags, names, authors) = currentRules()
                         val rules = container.blockedTagsStore.normalizeRules(tags, names, authors)
                         hasTagRules = rules.tags.isNotEmpty()
@@ -375,6 +442,7 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
                             items = filtered,
                             page = 1,
                             total = total,
+                            loadedCount = rawItems.size,
                             refreshing = false,
                             endReached = reached,
                             filtering = hasPendingEnrichment(rawItems),
@@ -416,27 +484,26 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
                         // 关键修复：按 id 去重，避免 API 分页边界返回重复 id 导致
                         // LazyGrid key={it.id} 抛 IllegalArgumentException 崩溃。
                         val existingIds = rawItems.mapTo(HashSet(rawItems.size + newItems.size)) { it.id }
-                        val deduped = newItems.filter { it.id !in existingIds }
+                        val deduped = newItems.filter { it.id.isNotBlank() && existingIds.add(it.id) }
                         // 用持久化缓存 + 已 enrich 缓存回填新页条目的 tags
                         container.comicTagsCache.ensureLoaded()
                         val enrichedNew = deduped.map { c ->
                             val enriched = enrichedDetailCache[c.id]
                             if (enriched != null) {
-                                enriched
+                                mergeMetadata(c, enriched)
                             } else {
                                 val cachedTags = container.comicTagsCache.get(c.id)
                                 if (cachedTags != null && c.tags.isEmpty()) c.copy(tags = cachedTags) else c
                             }
                         }
-                        // 缓存命中的新条目标记为已补全
-                        enrichedNew.forEach { c ->
-                            if (c.tags.isNotEmpty() && c.id !in enrichedIds) {
-                                enrichedIds.add(c.id)
-                                enrichedDetailCache[c.id] = c
-                            }
+                        // 只有详情元数据完整时才标记 enrich 完成；标签缓存不等于详情完整。
+                        enrichedNew.forEach { comic ->
+                            if (isTagComplete(comic)) enrichedIds.add(comic.id)
+                            if (isMetadataComplete(comic)) metadataCompleteIds.add(comic.id)
                         }
+                        listGeneration++
                         rawItems = rawItems + enrichedNew
-                        val reached = enrichedNew.isEmpty() || (total != null && rawItems.size >= total)
+                        val reached = isTerminalPage(next) || newItems.isEmpty() || (total != null && rawItems.size >= total)
                         val (tags, names, authors) = currentRules()
                         val rules = container.blockedTagsStore.normalizeRules(tags, names, authors)
                         hasTagRules = rules.tags.isNotEmpty()
@@ -451,6 +518,7 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
                             items = filtered,
                             page = next,
                             total = total ?: _state.value.total,
+                            loadedCount = rawItems.size,
                             loadingMore = false,
                             endReached = reached,
                             filtering = hasPendingEnrichment(rawItems),
@@ -540,7 +608,7 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
             return filtered to (coverHidden ?: emptySet())
         }
         // v27.12：一次性获取 enrichedIds 快照，避免 filterNot 内每条 item 都 synchronized。
-        val enrichedSnapshot = enrichedIds.toSet()
+        val enrichedSnapshot = synchronized(enrichedIds) { enrichedIds.toSet() }
         // 有 tag 规则：有 tags 的即时判定，无 tags 的持回（隐藏）
         val filtered = items.filterNot { comic ->
             // id="" 的条目无法 enrich，有 tags 就判定，无 tags 直接放行（无法精确屏蔽）。
@@ -589,14 +657,19 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
         }
     }
 
+    private fun isMetadataComplete(comic: ComicBriefDto): Boolean =
+        comic.name.isNotBlank() &&
+            !comic.author.isNullOrBlank() &&
+            comic.tags.isNotEmpty() &&
+            !comic.publishTime.isNullOrBlank()
+
+    private fun isTagComplete(comic: ComicBriefDto): Boolean = comic.tags.isNotEmpty()
+
     private fun runEnrich() {
         enrichJob?.cancel()
         enrichJob = viewModelScope.launch(Dispatchers.Default) {
             try {
-                val toEnrich = rawItems.filter {
-                    it.id.isNotEmpty() && it.id !in enrichedIds &&
-                        (enrichAttempts[it.id] ?: 0) < MAX_ENRICH_ATTEMPTS
-                }
+                val toEnrich = rawItems.filter(::needsEnrichment)
                 if (toEnrich.isEmpty()) {
                     if (_state.value.filtering) _state.value = _state.value.copy(filtering = false)
                     return@launch
@@ -617,30 +690,38 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
                         launch {
                             semaphore.withPermit {
                                 ensureActive()
-                                if (enrichedIds.contains(comic.id)) return@withPermit
+                                if (comic.id in metadataCompleteIds && (!hasTagRules || comic.id in enrichedIds)) return@withPermit
                                 // v27.13：不再阻塞等待滚动停止，也不拍快照。
                                 // enrich 只写 enrichedDetailCache，刷新时用 mergeEnriched 合并到最新 rawItems。
 
                                 var success = false
-                                repeat(MAX_ENRICH_ATTEMPTS) {
+                                repeat(MAX_ENRICH_ATTEMPTS) { attempt ->
                                     if (success) return@repeat
                                     try {
                                         val detail = kotlinx.coroutines.withTimeoutOrNull(ENRICH_TIMEOUT_MS) {
-                                            container.repository.comicDetail(comic.id)
+                                            container.repository.comicDetail(comic.id, forceRefresh = attempt > 0)
                                                 .let { (it as? Resource.Success)?.data }
                                         }
                                         if (detail != null) {
-                                            success = true
-                                            enrichedIds.add(comic.id)
-                                            enrichAttempts.remove(comic.id)
                                             val enriched = comic.copy(
+                                                name = detail.name.ifBlank { comic.name },
+                                                author = detail.author?.takeIf(String::isNotBlank) ?: comic.author,
                                                 tags = detail.tags.ifEmpty { comic.tags },
+                                                cover = detail.cover?.takeIf(String::isNotBlank) ?: comic.cover,
                                                 likes = detail.likes ?: comic.likes,
                                                 views = detail.views ?: comic.views,
-                                                publishTime = detail.publishTime ?: comic.publishTime,
+                                                publishTime = detail.publishTime?.takeIf(String::isNotBlank) ?: comic.publishTime,
                                             )
-                                            enrichedDetailCache[comic.id] = enriched
-                                            // 写入持久化缓存，下次加载直接命中
+                                            val merged = mergeMetadata(enrichedDetailCache[comic.id] ?: enriched, enriched)
+                                            enrichedDetailCache[comic.id] = merged
+                                            if (isTagComplete(merged)) enrichedIds.add(comic.id)
+                                            // 详情元数据与标签过滤分别判定，部分成功数据保留并可供后续列表合并。
+                                            val metadataComplete = isMetadataComplete(merged)
+                                            val tagsComplete = !hasTagRules || isTagComplete(merged)
+                                            success = metadataComplete && tagsComplete
+                                            if (metadataComplete) metadataCompleteIds.add(comic.id)
+                                            if (success) enrichAttempts.remove(comic.id)
+                                            // 写入持久化缓存，下次加载直接命中标签；作者/发布时间仍由完整性判断控制。
                                             if (enriched.tags.isNotEmpty()) {
                                                 container.comicTagsCache.put(comic.id, enriched.tags)
                                             }
@@ -665,19 +746,7 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
                                     if (scrolling) {
                                         enrichDirty = true
                                     } else {
-                                        val src = currentDataSource()
-                                        val (filtered, coverHidden) = applyBlock(src, rules, blockMode)
-                                        val stillPending = hasPendingEnrichment(src)
-                                        if (filtered != _state.value.items ||
-                                            stillPending != _state.value.filtering ||
-                                            coverHidden != _state.value.coverHiddenIds
-                                        ) {
-                                            _state.value = _state.value.copy(
-                                                items = filtered,
-                                                filtering = stillPending,
-                                                coverHiddenIds = coverHidden,
-                                            )
-                                        }
+                                        refreshUiStateFromRaw()
                                     }
                                 }
                             }
@@ -689,19 +758,7 @@ abstract class BaseListViewModel(protected val container: AppContainer) : ViewMo
                 if (scrolling) {
                     enrichDirty = true
                 } else {
-                    val src = currentDataSource()
-                    val (filtered, coverHidden) = applyBlock(src, rules, blockMode)
-                    val stillPending = hasPendingEnrichment(src)
-                    if (filtered != _state.value.items ||
-                        stillPending != _state.value.filtering ||
-                        coverHidden != _state.value.coverHiddenIds
-                    ) {
-                        _state.value = _state.value.copy(
-                            items = filtered,
-                            filtering = stillPending,
-                            coverHiddenIds = coverHidden,
-                        )
-                    }
+                    refreshUiStateFromRaw()
                 }
                 Logger.i("List", "补全字段完成")
             } catch (e: CancellationException) {

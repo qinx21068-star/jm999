@@ -58,6 +58,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.jmreader.core.Logger
 import com.jmreader.data.AppContainer
+import com.jmreader.data.api.direct.ApiDomainPolicy
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.sync.Semaphore
@@ -79,6 +80,7 @@ data class DomainItem(
     val testing: Boolean = false,
     val isCurrent: Boolean = false,
     val isCustom: Boolean = false,    // 用户自定义（可删）
+    val verifiedAtMillis: Long? = null,
 )
 
 class DomainViewModel(private val container: AppContainer) : ViewModel() {
@@ -86,12 +88,19 @@ class DomainViewModel(private val container: AppContainer) : ViewModel() {
     private val _items = mutableStateListOf<DomainItem>()
     val items: List<DomainItem> get() = _items
 
+    private val _candidates = mutableStateListOf<DomainItem>()
+    val candidates: List<DomainItem> get() = _candidates
+
     private val _events = MutableSharedFlow<String>()
     val events: SharedFlow<String> = _events.asSharedFlow()
 
     private val builtin: List<String> get() = container.directClient.apiDomainList()
 
-    init { reload() }
+    private var autoTestStarted = false
+    var verifyingCandidates by mutableStateOf(false)
+        private set
+
+    init { reload(autoTest = true) }
 
     /**
      * v27.5 稳定性加固：所有用户操作都用 launchSafe 包裹，IO 异常不会让进程崩溃。
@@ -112,7 +121,7 @@ class DomainViewModel(private val container: AppContainer) : ViewModel() {
      * 重新加载域名列表。DataStore 读取放到协程里，避免在主线程 runBlocking 造成 ANR。
      * 内置域名池读取（directClient.apiDomainList/currentDomain）是内存操作，可留在主线程。
      */
-    fun reload() {
+    fun reload(autoTest: Boolean = false) {
         val current = container.directClient.currentDomain()
         launchSafe {
             val custom = container.settingsStore.settings.first().customApiDomains
@@ -125,7 +134,28 @@ class DomainViewModel(private val container: AppContainer) : ViewModel() {
                     isCustom = custom.contains(host),
                 ))
             }
+            if (autoTest && !autoTestStarted) {
+                autoTestStarted = true
+                testAllInternal()
+            }
         }
+    }
+
+    private suspend fun testAllInternal() {
+        _items.indices.forEach { i -> _items[i] = _items[i].copy(testing = true, error = null, latency = null) }
+        val hosts = _items.toList().map { it.host }
+        val sem = Semaphore(4)
+        val results: List<Pair<String, Pair<Long?, String?>>> = withContext(Dispatchers.IO) {
+            hosts.map { host ->
+                async { sem.withPermit { host to container.directClient.testDomain(host) } }
+            }.map { it.await() }
+        }
+        for ((host, pair) in results) {
+            val i = _items.indexOfFirst { it.host == host }
+            if (i >= 0) _items[i] = _items[i].copy(testing = false, latency = pair.first, error = pair.second)
+        }
+        val ok = _items.count { it.error == null && it.latency != null }
+        _events.emit("测速完成：$ok/${_items.size} 可用")
     }
 
     /** 测速单个域名。 */
@@ -141,31 +171,15 @@ class DomainViewModel(private val container: AppContainer) : ViewModel() {
     }
 
     /** 测速全部（并发，限制并发到 4 避免触发限流/耗尽 socket）。 */
-    fun testAll() = launchSafe {
-        _items.indices.forEach { i -> _items[i] = _items[i].copy(testing = true, error = null, latency = null) }
-        val hosts = _items.toList().map { it.host }
-        // 关键修复：用 Semaphore(4) 限制并发，避免 20+ 域名同时请求触发禁漫 CDN 限流（IP 被临时封禁），
-        // 也避免弱网下 socket 耗尽。testDomain 内部用 testClient 短超时（6s）防单域名卡 40s。
-        val sem = kotlinx.coroutines.sync.Semaphore(4)
-        val results: List<Pair<String, Pair<Long?, String?>>> = withContext(Dispatchers.IO) {
-            hosts.map { host ->
-                async {
-                    sem.withPermit { host to container.directClient.testDomain(host) }
-                }
-            }.map { it.await() }
-        }
-        for ((host, pair) in results) {
-            val lat = pair.first
-            val err = pair.second
-            val i = _items.indexOfFirst { it.host == host }
-            if (i >= 0) _items[i] = _items[i].copy(testing = false, latency = lat, error = err)
-        }
-        val ok = _items.count { it.error == null && it.latency != null }
-        _events.emit("测速完成：$ok/${_items.size} 可用")
-    }
+    fun testAll() = launchSafe { testAllInternal() }
 
     /** 选中某域名为当前使用。 */
     fun select(host: String) = launchSafe {
+        val check = container.directClient.testDomain(host)
+        if (check.first == null || check.second != null) {
+            _events.emit("该线路本次验证失败，未切换：${check.second ?: "未返回延迟"}")
+            return@launchSafe
+        }
         container.directClient.selectDomain(host)
         _items.indices.forEach { i ->
             _items[i] = _items[i].copy(isCurrent = _items[i].host == host)
@@ -184,20 +198,33 @@ class DomainViewModel(private val container: AppContainer) : ViewModel() {
             _events.emit("域名不能为空")
             return@launchSafe
         }
-        // 格式校验：合法的 host 只能包含字母数字、点、连字符，且至少含一个点
-        if (!h.matches(Regex("^[A-Za-z0-9.-]+$")) || !h.contains('.')) {
-            _events.emit("域名格式不正确：$h")
+        val normalized = ApiDomainPolicy.normalize(h)
+        if (normalized == null) {
+            _events.emit("请输入有效的公网 API 域名")
             return@launchSafe
         }
-        if (_items.any { it.host.equals(h, ignoreCase = true) }) {
-            _events.emit("域名已存在：$h")
+        if (_items.any { ApiDomainPolicy.normalize(it.host) == normalized }) {
+            _events.emit("域名已存在：$normalized")
             return@launchSafe
         }
-        val custom = container.settingsStore.settings.first().customApiDomains + h
+        val check = container.directClient.testDomain(normalized)
+        if (check.first == null || check.second != null) {
+            _events.emit("本次 API 验证失败，未添加：${check.second ?: "未返回延迟"}")
+            return@launchSafe
+        }
+        val custom = container.settingsStore.settings.first().customApiDomains + normalized
+        if (_items.any { ApiDomainPolicy.normalize(it.host) == normalized }) {
+            _events.emit("域名已存在：$normalized")
+            return@launchSafe
+        }
         container.settingsStore.setCustomApiDomains(custom)
         container.directClient.mergeCustomDomains(custom.toList())
-        _items.add(0, DomainItem(host = h, isCustom = true, isCurrent = false))
-        _events.emit("已添加 $h，可点「测速」验证")
+        _items.add(0, DomainItem(
+            host = normalized, isCustom = true, latency = check.first,
+            verifiedAtMillis = System.currentTimeMillis(),
+        ))
+        _candidates.removeAll { it.host == normalized }
+        _events.emit("已添加本次 API 验证通过的域名：$normalized")
     }
 
     /** 删除自定义域名（内置不可删）。同步移除运行时域名池中的对应项。 */
@@ -215,17 +242,48 @@ class DomainViewModel(private val container: AppContainer) : ViewModel() {
         _events.emit("已删除 $host")
     }
 
-    /** 手动拉取禁漫最新域名并合并。 */
-    fun refreshFromServer() = launchSafe {
-        _events.emit("正在拉取最新域名…")
-        val ok = container.directClient.refreshDomains()
-        if (ok) {
-            reload()
-            _events.emit("已从服务器拉取最新域名并合并")
-        } else {
-            _events.emit("本次未更新域名（可能正在节流或网络不可达），请稍后重试")
+    /** Re-fetch and validate on the device; only this check's successful results are shown. */
+    fun refreshCandidates() {
+        if (verifyingCandidates) return
+        verifyingCandidates = true
+        _candidates.clear()
+        launchSafe {
+            try {
+                val hosts = container.directClient.fetchApiDomainCandidates()
+                if (hosts.isEmpty()) {
+                    _events.emit("域名服务未返回有效候选，已保留当前线路")
+                    return@launchSafe
+                }
+                val verified = container.directClient.verifyApiDomains(hosts)
+                val checkedAt = System.currentTimeMillis()
+                verified.forEach { (host, latency, error) ->
+                    val index = _items.indexOfFirst { it.host.equals(host, ignoreCase = true) }
+                    if (index >= 0) _items[index] = _items[index].copy(
+                        latency = latency, error = error,
+                        verifiedAtMillis = if (error == null) checkedAt else null,
+                    )
+                }
+                verified.filter { it.second != null && it.third == null }
+                    .sortedBy { it.second }
+                    .forEach { (host, latency, _) ->
+                        _candidates.add(DomainItem(host = host, latency = latency, verifiedAtMillis = checkedAt))
+                    }
+                _events.emit("本次 API 验证通过：${_candidates.size}/${hosts.size}；结果仅代表当前网络")
+            } finally {
+                verifyingCandidates = false
+            }
         }
     }
+
+    fun addVerifiedCandidate(host: String) {
+        if (_candidates.none { it.host == host }) return
+        // Revalidate before persisting; a displayed candidate may already have expired.
+        addCustom(host)
+    }
+
+    /** The refresh action previews validated candidates instead of silently changing the pool. */
+    fun refreshFromServer() = refreshCandidates()
+
 }
 
 class DomainVMFactory(private val container: AppContainer) : ViewModelProvider.Factory {
@@ -243,7 +301,7 @@ fun DomainManageScreen(container: AppContainer, onBack: () -> Unit) {
 
     var showAdd by remember { mutableStateOf(false) }
     var newHost by remember { mutableStateOf("") }
-    val anyTesting = items.any { it.testing }
+    val anyTesting = vm.verifyingCandidates || items.any { it.testing }
     // 删除确认：记录待删除的域名，确认后才真正删除
     var deleteTarget by remember { mutableStateOf<DomainItem?>(null) }
 
@@ -308,6 +366,34 @@ fun DomainManageScreen(container: AppContainer, onBack: () -> Unit) {
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                TextButton(enabled = !anyTesting, onClick = { vm.refreshCandidates() }) {
+                    Text(if (vm.verifyingCandidates) "正在验证候选…" else "验证并查看最新域名候选")
+                }
+            }
+            itemsIndexed(vm.candidates, key = { i, item -> "candidate_${item.host.lowercase()}_$i" }) { _, candidate ->
+                Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(candidate.host, style = MaterialTheme.typography.bodyMedium)
+                            Text("本次 API 验证通过 · ${candidate.latency} ms", style = MaterialTheme.typography.labelSmall)
+                            candidate.verifiedAtMillis?.let { checkedAt ->
+                                Text(
+                                    "检查时间：${java.text.DateFormat.getDateTimeInstance().format(java.util.Date(checkedAt))}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                )
+                            }
+
+                        }
+                        val alreadyAdded = items.any { it.host.equals(candidate.host, ignoreCase = true) }
+                        TextButton(enabled = !anyTesting && !alreadyAdded, onClick = { vm.addVerifiedCandidate(candidate.host) }) {
+                            Text(if (alreadyAdded) "已在池中" else "验证并添加")
+                        }
+
+                    }
+                }
             }
             itemsIndexed(items, key = { i, item -> item.host.lowercase().ifBlank { "idx_$i" } }) { _, item ->
                 // v27.5 性能修复：lambda 用 remember 缓存

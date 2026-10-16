@@ -2,6 +2,7 @@ package com.jmreader.data.api
 
 import com.jmreader.core.Logger
 import com.jmreader.core.LoggingInterceptor
+import com.jmreader.data.api.ResilientDns
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import okhttp3.OkHttpClient
@@ -51,6 +52,7 @@ object NetworkFactory {
             .readTimeout(20, TimeUnit.SECONDS)
             .writeTimeout(20, TimeUnit.SECONDS)
             .callTimeout(25, TimeUnit.SECONDS)   // 整个请求上限，超时即报错，避免无限转圈
+            .dns(ResilientDns)
             .retryOnConnectionFailure(true)
             .addInterceptor(LoggingInterceptor())
             .addInterceptor(HttpLoggingInterceptor().apply {

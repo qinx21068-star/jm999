@@ -2,6 +2,7 @@ package com.jmreader.data.api.direct
 
 import com.jmreader.core.Logger
 import com.jmreader.data.api.NetworkFactory
+import com.jmreader.data.api.ResilientDns
 import com.jmreader.data.dto.ChapterDto
 import com.jmreader.data.dto.ChapterImagesDto
 import com.jmreader.data.dto.ComicBriefDto
@@ -61,25 +62,14 @@ class JmDirectClient(
 ) {
 
     // ---- 域名池（禁漫移动端 API 域名，可轮换）----
-    // 内置最新已知有效域名（2026-07 实测多客户端汇总），避免首次启动时若字节 CDN 不可达就没有可用域名。
-    // 禁漫会定期换域，启动时及请求全失败时会通过 [refreshApiDomains] 动态拉取最新域名覆盖此列表。
-    // 用户也可在「设置 → 域名管理」手动增删（持久化于 SettingsStore，启动时合并进来）。
+    // 2026-10-16：三个域名服务解密后 Server 列表一致；下列四个域名均通过
+    // HTTPS、业务码、AES 解密及含有效 ID 的真实搜索检查。可用性仍需在设备网络复测。
+    // 启动/自愈刷新只接纳实时验证成功的服务器候选；全部失败时保留原池。
     private val apiDomains = mutableListOf(
         "www.cdnhjk.net",
         "www.cdngwc.cc",
         "www.cdngwc.net",
         "www.cdngwc.club",
-        "www.cdnutc.me",
-        "www.cdnhth.net",
-        "www.cdnhth.club",
-        "www.cdnbea.net",
-        // v27.6 新增线路：禁漫常用镜像域名，增加可用性
-        "www.cdnmhg.cc",
-        "www.cdnmhg.net",
-        "www.cdnfbs.net",
-        "www.cdnfbs.club",
-        "www.cdnds.net",
-        "www.cdnds.cc",
     )
     @Volatile private var domainIndex = 0
     // 动态刷新 API 域名时保留用户自定义线路。
@@ -123,13 +113,25 @@ class JmDirectClient(
      */
     @Volatile private var currentProxy: String? = null
     @Volatile private var selectedProxy: Proxy = Proxy.NO_PROXY
+    @Volatile private var proxyFailureUntilMs: Long = 0L
     private val dynamicProxySelector = object : ProxySelector() {
         override fun select(uri: URI): List<Proxy> {
-            return listOf(selectedProxy)
+            val selected = selectedProxy
+            if (selected == Proxy.NO_PROXY) return listOf(Proxy.NO_PROXY)
+            // A failed configured proxy should not black-hole all traffic. Offer a direct route
+            // as a fallback and temporarily prefer it after connectFailed is reported.
+            return if (System.currentTimeMillis() < proxyFailureUntilMs) {
+                listOf(Proxy.NO_PROXY, selected)
+            } else {
+                listOf(selected, Proxy.NO_PROXY)
+            }
         }
 
         override fun connectFailed(uri: URI, sa: java.net.SocketAddress, ioe: java.io.IOException) {
-            Logger.w("JmDirect", "代理连接失败 ${uri.host}: ${Logger.brief(ioe)}")
+            if (selectedProxy != Proxy.NO_PROXY) {
+                proxyFailureUntilMs = System.currentTimeMillis() + 60_000L
+                Logger.w("JmDirect", "代理连接失败 ${uri.host}，暂时回退直连: ${Logger.brief(ioe)}")
+            }
         }
     }
 
@@ -147,6 +149,9 @@ class JmDirectClient(
     /** v27.3 根因 #2：轮换/自愈专用短超时 client。同 [http]，代理切换时整体替换。 */
     @Volatile private var fastHttp: OkHttpClient = buildFastHttp()
 
+    // Initialized before the warmup coroutine can verify discovered API domains.
+    private val testClient: OkHttpClient = buildTestHttp()
+
     private fun buildMainHttp(): OkHttpClient {
         // v27.6 性能优化：增大连接池（默认 5 连接不够禁漫 8+ API 域名 + 6 图片 CDN 共用）
         // 和 Dispatcher 每域并发（默认 5，列表 20+ 封面同时加载会排队）
@@ -163,6 +168,7 @@ class JmDirectClient(
             .connectionPool(pool)
             .dispatcher(dispatcher)
             .proxySelector(dynamicProxySelector)
+            .dns(ResilientDns)
             .cookieJar(cookieJar)
             // v27.12 关键性能修复：图片 CDN 请求自动加禁漫 header。
             // 封面 URL（/media/albums/{id}.jpg）不带 jm_sid，走 Coil 默认 HttpUriFetcher，
@@ -224,6 +230,7 @@ class JmDirectClient(
             .connectionPool(pool)
             .dispatcher(dispatcher)
             .proxySelector(dynamicProxySelector)
+            .dns(ResilientDns)
             .cookieJar(cookieJar)
         return b.build()
     }
@@ -282,7 +289,13 @@ class JmDirectClient(
      *               false=受 5 分钟节流约束（启动时主动刷新）
      * @return 是否成功更新
      */
-    private suspend fun refreshApiDomains(forced: Boolean): Boolean {
+    private suspend fun refreshApiDomains(forced: Boolean): Boolean =
+        // Bound discovery and verification together; cancellation still releases refreshLock state.
+        kotlinx.coroutines.withTimeoutOrNull(12_000L) {
+            refreshApiDomainsWithinBudget(forced)
+        } ?: false
+
+    private suspend fun refreshApiDomainsWithinBudget(forced: Boolean): Boolean {
         val now = System.currentTimeMillis()
         synchronized(refreshLock) {
             // 关键修复（Bug 13）：之前 forced=true 完全无节流，断网场景下每个失败请求都会
@@ -312,8 +325,13 @@ class JmDirectClient(
                     if (text.isBlank()) return@use
                     val json = JSONObject(JMCrypto.decodeDomainServerResp(text))
                     val arr = json.optJSONArray("Server") ?: return@use
-                    val list = (0 until arr.length())
-                        .mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }
+                    val candidates = (0 until arr.length())
+                        .mapNotNull { ApiDomainPolicy.normalize(arr.opt(it) as? String) }
+                        .distinct().take(32)
+                    val list = verifyApiDomains(candidates)
+                        .filter { it.second != null && it.third == null }
+                        .sortedBy { it.second }
+                        .map { it.first }
                     if (list.isNotEmpty()) {
                         synchronized(apiDomains) {
                             val preferred = apiDomains.getOrNull(domainIndex)
@@ -703,12 +721,10 @@ class JmDirectClient(
         val json = JSONObject(reqApi("/album", mapOf("id" to albumId)))
         val data = json.optJSONObject("data") ?: json
         val name = data.optString("name")
-        val author = data.optJSONArray("author")?.let { arr ->
-            (0 until arr.length()).joinToString(" ") { arr.optString(it) }.ifBlank { null }
-        }
-        val tags = data.optJSONArray("tags")?.let { arr ->
-            (0 until arr.length()).map { arr.optString(it) }.filter { it.isNotBlank() }
-        } ?: emptyList()
+        val author = parseAuthor(data.opt("author")) ?: parseAuthor(data.opt("authors"))
+        val tags = parseStringList(data.opt("tags"))
+            .ifEmpty { parseStringList(data.opt("tags_list")) }
+            .ifEmpty { parseStringList(data.opt("tag")) }
         // 角色（actors）：API 返回数组，如 ['神里绫华']；详情页像官方客户端那样显示角色。
         val actors = data.optJSONArray("actors")?.let { arr ->
             (0 until arr.length()).map { arr.optString(it) }.filter { it.isNotBlank() }
@@ -866,20 +882,25 @@ class JmDirectClient(
      * 值可能是秒级 Unix 时间戳，也可能是 "yyyy-MM-dd" 字符串。
      */
     private fun parsePublishTime(data: JSONObject): String? {
-        val candidates = listOf("addtime", "timestamp", "time", "pub_date", "publish_time", "created_at")
+        val candidates = listOf("adddate", "add_date", "addtime", "add_time", "timestamp", "time", "pub_date", "publish_time", "publishTime", "created_at", "createdAt", "date")
         for (key in candidates) {
-            val v = data.optString(key).orEmpty()
-            if (v.isBlank()) continue
-            // 纯数字 → 当作 Unix 时间戳（秒）格式化
-            v.toLongOrNull()?.let { ts ->
-                val sec = if (ts > 1_000_000_000_000L) ts / 1000 else ts  // 兼容毫秒
-                return runCatching {
+            val raw = data.opt(key)
+            if (raw !is String && raw !is Number) continue
+            val value = raw.toString().trim()
+            if (value.isEmpty() || value.equals("null", ignoreCase = true)) continue
+            val timestamp = value.toLongOrNull()
+            if (timestamp != null) {
+                if (timestamp <= 0L) continue
+                val seconds = if (timestamp >= 1_000_000_000_000L) timestamp / 1000L else timestamp
+                if (seconds !in 1L..253_402_300_799L) continue
+                val date = runCatching {
                     java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
-                        .format(java.util.Date(sec * 1000))
-                }.getOrNull() ?: v
+                        .format(java.util.Date(seconds * 1000L))
+                }.getOrNull()
+                if (date != null) return date
+            } else if (!value.startsWith("0000-00-00")) {
+                return value
             }
-            // 非数字 → 原样返回（可能是已格式化的日期串）
-            return v
         }
         return null
     }
@@ -1105,20 +1126,22 @@ class JmDirectClient(
      * 测速专用 client：短超时（5s），避免单个域名卡 40s 让用户等几分钟。
      * 独立于 [http]，不影响正常请求。
      */
-    @Volatile private var testClient: OkHttpClient = buildTestHttp()
 
     private fun buildTestHttp(): OkHttpClient {
         val builder = OkHttpClient.Builder()
             .connectTimeout(5, TimeUnit.SECONDS)
             .readTimeout(5, TimeUnit.SECONDS)
             .callTimeout(6, TimeUnit.SECONDS)
+            .followRedirects(false)
+            .followSslRedirects(false)
             .retryOnConnectionFailure(false)
             .proxySelector(dynamicProxySelector)
+            .dns(ResilientDns)
         return builder.build()
     }
 
     /**
-     * 测速单个域名：发一个轻量请求（/search 空关键词），返回延迟(ms)或失败原因。
+     * 测速单个域名：用真实搜索验证 HTTP、业务码、AES 及漫画列表结构。
      * @return Pair<延迟ms, 错误信息?>；成功时错误为 null
      *
      * 关键修复（Bug 28）：之前文件里同时存在两个 testDomain 定义（旧版用 http 40s 超时，
@@ -1127,48 +1150,123 @@ class JmDirectClient(
      * 2) 即使能编译，旧版会被优先解析，testClient 形同虚设，弱网下批量测速仍卡 320s。
      * 现在合并为单一实现，统一用 testClient 短超时。
      */
-    suspend fun testDomain(host: String): Pair<Long?, String?> {
-        val t = ts()
-        val token = JMCrypto.token(t)
-        val tokenparam = JMCrypto.tokenparam(t)
-        val url = HttpUrl.Builder().scheme("https").host(host)
-            .addPathSegments("search")
-            .addQueryParameter("main_tag", "0")
-            .addQueryParameter("search_query", "")
-            .addQueryParameter("page", "1")
-            .addQueryParameter("o", "mr")
-            .addQueryParameter("t", "a")
-            .build()
-        val req = Request.Builder()
-            .url(url)
-            .header("User-Agent", UA)
-            .header("token", token)
-            .header("tokenparam", tokenparam)
-            .get()
-            .build()
-        return try {
-            val start = System.currentTimeMillis()
-            // 关键修复：用 testClient 短超时，避免单域名卡 40s。
+    suspend fun testDomain(host: String): Pair<Long?, String?> = kotlinx.coroutines.withContext(Dispatchers.IO) {
+        val normalized = ApiDomainPolicy.normalize(host)
+            ?: return@withContext null to "API 域名格式无效"
+        try {
+            val t = ts()
+            val url = HttpUrl.Builder().scheme("https").host(normalized)
+                .addPathSegment("search")
+                .addQueryParameter("main_tag", "0")
+                .addQueryParameter("search_query", "汉化")
+                .addQueryParameter("page", "1")
+                .addQueryParameter("o", "mr")
+                .addQueryParameter("t", "a")
+                .build()
+            val req = Request.Builder().url(url)
+                .header("User-Agent", UA)
+                .header("token", JMCrypto.token(t))
+                .header("tokenparam", JMCrypto.tokenparam(t))
+                .header("Cache-Control", "no-cache")
+                .get().build()
+            val start = android.os.SystemClock.elapsedRealtime()
             testClient.executeCancellable(req).use { resp ->
-                val latency = System.currentTimeMillis() - start
-                if (!resp.isSuccessful) return latency to "HTTP ${resp.code}"
-                val body = resp.body?.string().orEmpty()
-                val outer = JSONObject(body)
-                if (outer.optInt("code", -1) != 200) {
-                    return latency to outer.optString("errorMsg", "code=${outer.optInt("code")}")
-                }
-                // 尝试解密验证完整性
-                val data = outer.optString("data")
-                if (data.isNotBlank()) {
-                    JMCrypto.decodeRespData(data, t)
-                }
-                latency to null
+                require(resp.code == 200 && resp.request.url.host == normalized) { "HTTP ${resp.code} 或域名跳转" }
+                val outer = JSONObject(resp.body?.string().orEmpty())
+                require(outer.optInt("code", -1) == 200) { "API 业务码 ${outer.optInt("code", -1)}" }
+                val data = outer.opt("data") as? String
+                require(!data.isNullOrBlank()) { "API 未返回加密数据" }
+                val payload = JSONObject(JMCrypto.decodeRespData(data, t))
+                val records = payload.optJSONArray("content") ?: payload.optJSONArray("list")
+                    ?: error("API 缺少搜索列表")
+                require(records.length() > 0 && (0 until records.length()).all { index ->
+                    val record = records.optJSONObject(index)
+                    record != null && record.optString("id").matches(Regex("[0-9]{1,18}")) &&
+                        !record.isNull("name") && record.optString("name").isNotBlank()
+                }) { "搜索未返回有效漫画记录" }
+                (android.os.SystemClock.elapsedRealtime() - start) to null
             }
         } catch (e: CancellationException) {
             throw e
-        } catch (e: Throwable) {
+        } catch (e: Exception) {
             null to Logger.brief(e)
         }
+    }
+
+    /** Tests never select a host or modify the active pool. */
+    suspend fun verifyApiDomains(hosts: List<String>): List<Triple<String, Long?, String?>> = coroutineScope {
+        val limit = Semaphore(4)
+        hosts.mapNotNull(ApiDomainPolicy::normalize).distinct().take(32).map { host ->
+            async(Dispatchers.IO) {
+                limit.withPermit {
+                    val result = testDomain(host)
+                    Triple(host, result.first, result.second)
+                }
+            }
+        }.awaitAll()
+    }
+
+    /** Measures time to an actual cover prefix; an HTML challenge never counts as an image. */
+    suspend fun testImageDomain(host: String, albumId: String): Pair<Long?, String?> = kotlinx.coroutines.withContext(Dispatchers.IO) {
+        val normalized = ApiDomainPolicy.normalize(host) ?: return@withContext null to "图片域名格式无效"
+        val id = albumId.trim().replace(Regex("(?i)^JM"), "")
+        if (!id.matches(Regex("[0-9]{1,18}"))) return@withContext null to "漫画 ID 无效"
+        try {
+            val request = Request.Builder()
+                .url(HttpUrl.Builder().scheme("https").host(normalized).addPathSegments("media/albums/$id.jpg").build())
+                .header("User-Agent", UA)
+                .header("Referer", "https://www.cdnaspa.club/")
+                .header("Accept", "image/*")
+                .get().build()
+            val started = android.os.SystemClock.elapsedRealtime()
+            testClient.executeCancellable(request).use { response ->
+                require(response.code == 200 && response.request.url.host == normalized) { "图片 HTTP ${response.code} 或跳转" }
+                val body = response.body ?: error("图片响应为空")
+                val prefix = ByteArray(12)
+                var count = 0
+                val stream = body.byteStream()
+                while (count < prefix.size) {
+                    val read = stream.read(prefix, count, prefix.size - count)
+                    if (read < 0) break
+                    count += read
+                }
+                val jpeg = count >= 3 && prefix[0] == 0xff.toByte() && prefix[1] == 0xd8.toByte() && prefix[2] == 0xff.toByte()
+                val png = count >= 8 && prefix.copyOfRange(0, 8).contentEquals(byteArrayOf(0x89.toByte(), 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a))
+                val gif = count >= 6 && String(prefix, 0, 6, Charsets.US_ASCII) in setOf("GIF87a", "GIF89a")
+                val webp = count >= 12 && String(prefix, 0, 4, Charsets.US_ASCII) == "RIFF" && String(prefix, 8, 4, Charsets.US_ASCII) == "WEBP"
+                require(jpeg || png || gif || webp) { "响应未通过图片文件头校验" }
+                (android.os.SystemClock.elapsedRealtime() - started) to null
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            null to Logger.brief(e)
+        }
+    }
+
+    /** 只读拉取最新 API 域名候选，不修改当前运行时域名池。 */
+    suspend fun fetchApiDomainCandidates(): List<String> = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        for (url in apiDomainServerUrls) {
+            try {
+                val request = Request.Builder().url(url).get().build()
+                fastHttp.executeCancellable(request).use { response ->
+                    if (!response.isSuccessful) return@use
+                    val text = response.body?.string().orEmpty()
+                    if (text.isBlank()) return@use
+                    val json = JSONObject(JMCrypto.decodeDomainServerResp(text))
+                    val array = json.optJSONArray("Server") ?: return@use
+                    val candidates = (0 until array.length())
+                        .mapNotNull { ApiDomainPolicy.normalize(array.opt(it) as? String) }
+                        .distinct().take(32)
+                    if (candidates.isNotEmpty()) return@withContext candidates
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                Logger.w("JmDirect", "读取域名候选失败 $url: ${Logger.brief(e)}")
+            }
+        }
+        emptyList()
     }
 
     /** 手动触发一次域名动态更新（界面"刷新域名"按钮用）。 */
@@ -1325,12 +1423,12 @@ class JmDirectClient(
                 if (id.isBlank()) continue
                 // 关键修复：禁漫列表接口的 author 字段可能是字符串或数组，统一处理。
                 // 之前直接 optString("author")，遇到数组形式返回空字符串 → 作者显示为 null。
-                val author = parseAuthor(it.opt("author"))
+                val author = (parseAuthor(it.opt("author")) ?: parseAuthor(it.opt("authors")))
                 items.add(ComicBriefDto(
                     id = id,
                     name = it.optString("name"),
                     author = author,
-                    tags = parseItemTags(it),
+                    tags = parseStringList(it.opt("tags")).ifEmpty { parseStringList(it.opt("tags_list")) }.ifEmpty { parseStringList(it.opt("tag")) },
                     cover = buildCoverUrl(id),
                     // 关键修复：禁漫列表接口 likes 字段名可能是 likes/like_cnt/like_count，
                     // views 字段可能是 total_views/views/clicks，多套兜底避免字段缺失。
@@ -1353,8 +1451,10 @@ class JmDirectClient(
      */
     private fun pickFirst(obj: JSONObject, vararg keys: String): String? {
         for (k in keys) {
-            val v = obj.optString(k).ifBlank { null }
-            if (v != null) return v
+            val raw = obj.opt(k)
+            if (raw !is String && raw !is Number) continue
+            val value = raw.toString().trim()
+            if (value.isNotEmpty() && !value.equals("null", ignoreCase = true)) return value
         }
         return null
     }
@@ -1363,14 +1463,26 @@ class JmDirectClient(
      * 解析 author 字段，兼容字符串和数组两种返回形式。
      * 禁漫部分接口 author 返回 ["作者名"] 数组，部分返回 "作者名" 字符串。
      */
-    private fun parseAuthor(authorVal: Any?): String? {
-        return when (authorVal) {
-            is JSONArray -> (0 until authorVal.length())
-                .joinToString(" ") { authorVal.optString(it) }
-                .ifBlank { null }
-            is String -> authorVal.ifBlank { null }
-            else -> null
-        }
+    private fun parseAuthor(authorVal: Any?): String? = when (authorVal) {
+        is JSONArray -> (0 until authorVal.length())
+            .mapNotNull { parseAuthor(authorVal.opt(it)) }
+            .joinToString(" ")
+            .ifBlank { null }
+        is JSONObject -> pickFirst(authorVal, "name", "title", "username", "nickname")
+        is String -> authorVal.trim().takeIf { it.isNotEmpty() && !it.equals("null", ignoreCase = true) }
+        else -> null
+    }
+
+    private fun parseStringList(value: Any?): List<String> = when (value) {
+        is JSONArray -> (0 until value.length()).flatMap { parseStringList(value.opt(it)) }
+        is JSONObject -> listOfNotNull(pickFirst(value, "name", "title", "tag", "text"))
+            .ifEmpty { parseStringList(value.opt("tags")) }
+            .ifEmpty { parseStringList(value.opt("list")) }
+            .ifEmpty { parseStringList(value.opt("items")) }
+        is String -> value.split(',', '，', '、', ' ', '\n')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !it.equals("null", ignoreCase = true) }
+        else -> emptyList()
     }
 
     private fun parseFavoritePage(json: JSONObject, page: Int): PageResultDto {
@@ -1385,8 +1497,8 @@ class JmDirectClient(
                 items.add(ComicBriefDto(
                     id = id,
                     name = it.optString("name"),
-                    author = parseAuthor(it.opt("author")),
-                    tags = parseItemTags(it),
+                    author = (parseAuthor(it.opt("author")) ?: parseAuthor(it.opt("authors"))),
+                    tags = parseStringList(it.opt("tags")).ifEmpty { parseStringList(it.opt("tags_list")) }.ifEmpty { parseStringList(it.opt("tag")) },
                     cover = buildCoverUrl(id),
                     likes = pickFirst(it, "likes", "like_cnt", "like_count"),
                     views = pickFirst(it, "total_views", "views", "clicks"),

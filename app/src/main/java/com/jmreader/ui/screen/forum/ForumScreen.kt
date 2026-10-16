@@ -18,6 +18,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -46,6 +48,10 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.key
+import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -56,6 +62,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -66,8 +73,9 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import com.jmreader.data.AppContainer
 import com.jmreader.data.dto.JmCommentDto
+import com.jmreader.data.dto.ComicDetailDto
 import com.jmreader.data.repository.Resource
-import kotlinx.coroutines.CancellationException
+import coil.compose.AsyncImage
 
 /**
  * 讨论区：原生 Compose UI 渲染全局评论信息流。
@@ -89,78 +97,20 @@ fun ForumScreen(
     onOpenComic: (String) -> Unit,
     container: AppContainer,
 ) {
-    var comments by remember { mutableStateOf<List<JmCommentDto>>(emptyList()) }
-    var page by androidx.compose.runtime.saveable.rememberSaveable { mutableIntStateOf(1) }
-    var totalPages by androidx.compose.runtime.saveable.rememberSaveable { mutableIntStateOf(1) }
-    var totalCount by remember { mutableIntStateOf(0) }
-
-    var loading by remember { mutableStateOf(true) }
-    var error by remember { mutableStateOf<String?>(null) }
-    var loadTrigger by remember { mutableIntStateOf(0) }
-
-    fun loadPage(target: Int) {
-        page = target
-        loading = true
-        error = null
-        loadTrigger++
-    }
-
-    // v27.9：通过 /forum JSON API 加载全局评论流（替代 HTML 抓取）。
-    // reqApi 内部已做域名轮换 + 自愈，单次重试足够覆盖瞬时网络抖动。
-    LaunchedEffect(loadTrigger, page) {
-        if (loadTrigger == 0) return@LaunchedEffect
-        val target = page
-        try {
-            val r = container.repository.forum(mode = "manhua", aid = null, uid = null, page = target)
-            when (r) {
-                is Resource.Success -> {
-                    comments = r.data.list
-                    totalCount = r.data.total
-                    if (target == 1) {
-                        totalPages = if (r.data.total <= 0) 1
-                        else {
-                            val pageSize = if (r.data.list.isNotEmpty()) r.data.list.size else 10
-                            (r.data.total + pageSize - 1) / pageSize
-                        }
-                    }
-                    loading = false
-                }
-                is Resource.Error -> {
-                    // 单次重试
-                    kotlinx.coroutines.delay(800L)
-                    val r2 = container.repository.forum(mode = "manhua", aid = null, uid = null, page = target)
-                    when (r2) {
-                        is Resource.Success -> {
-                            comments = r2.data.list
-                            totalCount = r2.data.total
-                            if (target == 1) {
-                                totalPages = if (r2.data.total <= 0) 1
-                                else {
-                                    val pageSize = if (r2.data.list.isNotEmpty()) r2.data.list.size else 10
-                                    (r2.data.total + pageSize - 1) / pageSize
-                                }
-                            }
-                            loading = false
-                        }
-                        is Resource.Error -> {
-                            loading = false
-                            error = r2.message
-                        }
-                        Resource.Loading -> {}
-                    }
-                }
-                Resource.Loading -> {}
-            }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Throwable) {
-            loading = false
-            error = e.message ?: e::class.simpleName ?: "未知错误"
+    val vm: ForumViewModel = viewModel(factory = ForumVMFactory(container))
+    val state by vm.state.collectAsState()
+    val comments = state.comments
+    val page = state.page
+    val totalPages = state.totalPages
+    val totalCount = state.total
+    val loading = state.loading
+    val error = state.error
+    // key by committed page; a failed request retains both list and scroll position.
+    val listState = key(page) { rememberLazyListState(vm.scrollIndex, vm.scrollOffset) }
+    DisposableEffect(vm, listState, page) {
+        onDispose {
+            vm.saveScroll(page, listState.firstVisibleItemIndex, listState.firstVisibleItemScrollOffset)
         }
-    }
-
-    LaunchedEffect(Unit) {
-        if (comments.isEmpty() && loadTrigger == 0) loadPage(page.coerceAtLeast(1))
     }
 
     Scaffold(
@@ -179,7 +129,7 @@ fun ForumScreen(
                     }
                 },
                 actions = {
-                    IconButton(onClick = { loadPage(page) }) {
+                    IconButton(onClick = { vm.loadPage(page) }, enabled = !loading) {
                         Icon(Icons.Outlined.Refresh, contentDescription = "刷新")
                     }
                 },
@@ -194,12 +144,17 @@ fun ForumScreen(
             if (comments.isNotEmpty()) {
                 ForumListContent(
                     comments = comments,
+                    previews = state.previews,
+                    previewErrors = state.previewErrors,
+                    onRetryPreview = vm::retryPreview,
+                    listState = listState,
+                    pagingEnabled = !loading,
                     page = page,
                     totalPages = totalPages,
                     onOpenComic = onOpenComic,
-                    onPrev = { if (page > 1) loadPage(page - 1) },
-                    onNext = { if (page < totalPages) loadPage(page + 1) },
-                    onJumpToPage = { target -> if (target != page) loadPage(target) },
+                    onPrev = { if (page > 1) vm.loadPage(page - 1) },
+                    onNext = { if (page < totalPages) vm.loadPage(page + 1) },
+                    onJumpToPage = { target -> if (target != page) vm.loadPage(target) },
                     modifier = Modifier.fillMaxSize(),
                 )
             } else if (loading) {
@@ -212,7 +167,7 @@ fun ForumScreen(
                 if (err != null) {
                     ErrorBox(
                         message = err,
-                        onRetry = { loadPage(page) },
+                        onRetry = vm::retry,
                         modifier = Modifier.fillMaxSize(),
                     )
                 } else {
@@ -236,8 +191,8 @@ fun ForumScreen(
             if (bannerErr != null && comments.isNotEmpty()) {
                 PageErrorBanner(
                     message = bannerErr,
-                    onRetry = { loadPage(page) },
-                    onDismiss = { error = null },
+                    onRetry = vm::retry,
+                    onDismiss = vm::dismissError,
                     modifier = Modifier
                         .fillMaxWidth()
                         .align(Alignment.TopCenter),
@@ -309,6 +264,11 @@ internal fun LoadingShield(
 @Composable
 private fun ForumListContent(
     comments: List<JmCommentDto>,
+    previews: Map<String, ComicDetailDto>,
+    previewErrors: Map<String, String>,
+    onRetryPreview: (String) -> Unit,
+    listState: LazyListState,
+    pagingEnabled: Boolean,
     page: Int,
     totalPages: Int,
     onOpenComic: (String) -> Unit,
@@ -319,12 +279,22 @@ private fun ForumListContent(
 ) {
     var showJumpDialog by remember { mutableStateOf(false) }
     LazyColumn(
+        state = listState,
         modifier = modifier,
         contentPadding = PaddingValues(12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        itemsIndexed(comments, key = { i, c -> c.cid.ifBlank { "idx_$i" } }) { _, c ->
-            ForumCommentCard(comment = c, onOpenComic = onOpenComic)
+        itemsIndexed(comments, key = { i, c -> "$i:${c.cid}" }) { _, c ->
+            val aid = forumComicId(c)
+            ForumCommentCard(
+                comment = c,
+                comicId = aid,
+                preview = aid?.let { previews[it] },
+                previewError = aid?.let { previewErrors[it] },
+                onRetryPreview = { if (aid != null) onRetryPreview(aid) },
+                onOpenComic = onOpenComic,
+            )
+
         }
         // 分页栏：首页 / 上一页 / 页码(可点跳页) / 下一页 / 末页
         item(key = "pagination") {
@@ -335,9 +305,9 @@ private fun ForumListContent(
             ) {
                 IconButton(
                     onClick = { onJumpToPage(1) },
-                    enabled = page > 1,
+                    enabled = pagingEnabled && page > 1,
                 ) { Icon(Icons.Outlined.FirstPage, contentDescription = "第一页") }
-                IconButton(onClick = onPrev, enabled = page > 1) {
+                IconButton(onClick = onPrev, enabled = pagingEnabled && page > 1) {
                     Icon(Icons.AutoMirrored.Outlined.NavigateBefore, contentDescription = "上一页")
                 }
                 Text(
@@ -347,15 +317,15 @@ private fun ForumListContent(
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier
                         .clip(RoundedCornerShape(8.dp))
-                        .clickable { showJumpDialog = true }
+                        .clickable(enabled = pagingEnabled) { showJumpDialog = true }
                         .padding(horizontal = 16.dp, vertical = 8.dp),
                 )
-                IconButton(onClick = onNext, enabled = page < totalPages) {
+                IconButton(onClick = onNext, enabled = pagingEnabled && page < totalPages) {
                     Icon(Icons.AutoMirrored.Outlined.NavigateNext, contentDescription = "下一页")
                 }
                 IconButton(
                     onClick = { onJumpToPage(totalPages) },
-                    enabled = page < totalPages,
+                    enabled = pagingEnabled && page < totalPages,
                 ) { Icon(Icons.Outlined.LastPage, contentDescription = "最后一页") }
             }
         }
@@ -418,7 +388,15 @@ private fun ForumPageJumpDialog(
 }
 
 @Composable
-private fun ForumCommentCard(comment: JmCommentDto, onOpenComic: (String) -> Unit) {
+private fun ForumCommentCard(
+    comment: JmCommentDto,
+    comicId: String?,
+    preview: ComicDetailDto?,
+    previewError: String?,
+    onRetryPreview: () -> Unit,
+    onOpenComic: (String) -> Unit,
+) {
+
     val ctx = LocalContext.current
     Card(
         modifier = Modifier
@@ -437,7 +415,8 @@ private fun ForumCommentCard(comment: JmCommentDto, onOpenComic: (String) -> Uni
         elevation = CardDefaults.cardElevation(defaultElevation = com.jmreader.ui.theme.LocalCardElevation.current),
         shape = RoundedCornerShape(14.dp),
     ) {
-        Column(Modifier.padding(14.dp)) {
+        Row(Modifier.padding(14.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Column(Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 com.jmreader.ui.components.UserAvatar(
                     avatar = comment.photo,
@@ -536,6 +515,55 @@ private fun ForumCommentCard(comment: JmCommentDto, onOpenComic: (String) -> Uni
                     Spacer(Modifier.height(6.dp))
                 }
             }
+        }
+        if (comicId != null) {
+            ForumComicPreview(
+                comicId = comicId,
+                title = preview?.name?.takeIf { it.isNotBlank() } ?: comment.name,
+                preview = preview,
+                error = previewError,
+                onRetry = onRetryPreview,
+                onOpen = { onOpenComic(comicId) },
+            )
+        }
+        }
+    }
+}
+
+@Composable
+private fun ForumComicPreview(
+    comicId: String,
+    title: String,
+    preview: ComicDetailDto?,
+    error: String?,
+    onRetry: () -> Unit,
+    onOpen: () -> Unit,
+) {
+    Column(
+        modifier = Modifier.width(96.dp).clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant).clickable(onClick = onOpen).padding(6.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        if (!preview?.cover.isNullOrBlank()) {
+            AsyncImage(
+                model = preview?.cover,
+                contentDescription = title,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxWidth().height(116.dp).clip(RoundedCornerShape(6.dp)),
+            )
+        } else if (preview == null && error == null) {
+            Box(Modifier.fillMaxWidth().height(116.dp), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+            }
+        }
+        if (title.isNotBlank()) Text(title, style = MaterialTheme.typography.labelSmall, maxLines = 3, overflow = TextOverflow.Ellipsis)
+        Text("JM$comicId", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+        preview?.tags?.takeIf { it.isNotEmpty() }?.let { tags ->
+            Text(tags.joinToString(" · "), style = MaterialTheme.typography.labelSmall, maxLines = 4, overflow = TextOverflow.Ellipsis)
+        }
+        if (error != null) {
+            Text("预览加载失败", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+            TextButton(onClick = onRetry, contentPadding = PaddingValues(0.dp)) { Text("重试预览") }
         }
     }
 }

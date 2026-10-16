@@ -225,6 +225,7 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
     // ============= v27.5 搜索 setters =============
     fun setSaveSearchHistory(v: Boolean) = launchSafe { container.settingsStore.setSaveSearchHistory(v) }
     fun setSearchTagFilter(v: Boolean) = launchSafe { container.settingsStore.setSearchTagFilter(v) }
+    fun setHomeTagRecommendations(v: Boolean) = launchSafe { container.settingsStore.setHomeTagRecommendations(v) }
 
     // ============= v27.5 下载 setters =============
     fun setDownloadConcurrency(v: Int) = launchSafe {
@@ -1156,7 +1157,7 @@ private fun ReaderSettingsScreen(
             SwitchRow(
                 title = "沉浸式全屏",
                 subtitle = "阅读时隐藏状态栏和系统导航栏；点击屏幕显示工具栏，退出阅读器后自动恢复。",
-                checked = settings?.immersiveReader ?: false,
+                checked = settings?.immersiveReader ?: true,
                 onCheckedChange = { vm.setImmersiveReader(it) },
                 enabled = settingsLoaded,
             )
@@ -1361,8 +1362,8 @@ private fun ReaderSettingsScreen(
             title = "加载与进度",
             icon = Icons.Outlined.MenuBook,
         ) {
-            SliderRow("Wi-Fi 预取页数", "提前准备接下来的图片，0 表示关闭。", (settings?.prefetchWifiPages ?: 2).toFloat(), 0f..3f, { vm.setPrefetchWifiPages(it.toInt()) }, settingsLoaded, { "${it.toInt()} 页" })
-            SliderRow("移动网络预取页数", "较小的窗口节省流量和内存。", (settings?.prefetchMobilePages ?: 1).toFloat(), 0f..3f, { vm.setPrefetchMobilePages(it.toInt()) }, settingsLoaded, { "${it.toInt()} 页" })
+            SliderRow("Wi-Fi 预取页数", "提前准备接下来的图片，0 表示关闭；较大窗口会增加流量和缓存占用。", (settings?.prefetchWifiPages ?: 10).toFloat(), 0f..10f, { vm.setPrefetchWifiPages(it.toInt()) }, settingsLoaded, { "${it.toInt()} 页" })
+            SliderRow("移动网络预取页数", "较小的窗口节省流量和内存。", (settings?.prefetchMobilePages ?: 4).toFloat(), 0f..4f, { vm.setPrefetchMobilePages(it.toInt()) }, settingsLoaded, { "${it.toInt()} 页" })
             SwitchRow("低电量停止预取", "未充电且电量不高于 15% 时停止后台预取。", settings?.prefetchDisableLowBattery ?: true, { vm.setPrefetchDisableLowBattery(it) }, settingsLoaded)
             SwitchRow(
                 title = "预加载下一章",
@@ -1428,6 +1429,14 @@ private fun DiscoverySettingsScreen(
                 subtitle = "搜索后显示 Tag chips 二级过滤，方便从结果中精选。",
                 checked = settings?.searchTagFilter ?: true,
                 onCheckedChange = { vm.setSearchTagFilter(it) },
+                enabled = settingsLoaded,
+            )
+            HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
+            SwitchRow(
+                title = "首页模板标签推荐",
+                subtitle = "根据已保存搜索模板的标签混合推荐漫画。",
+                checked = settings?.homeTagRecommendations ?: true,
+                onCheckedChange = { vm.setHomeTagRecommendations(it) },
                 enabled = settingsLoaded,
             )
         }

@@ -268,8 +268,8 @@ fun JMApp(container: AppContainer) {
                     onOpenLogs = { navController.navigate(Routes.LOGS) },
                     // 单击标签 → 用标签词搜索；导航到搜索页并带上 q 参数
                     onSearchByTag = { tag -> navController.navigate(Routes.search(tag)) },
-                    // v27.5 #13：单击作者名 → 跳作者主页（独立 Screen，基于搜索 API）
-                    onSearchByAuthor = { author -> navController.navigate(Routes.author(author)) },
+                    // 单击作者名 → 在搜索页带入作者名并自动搜索。
+                    onSearchByAuthor = { author -> navController.navigate(Routes.search(author)) },
                     // 查看评论区（完整分页）
                     onOpenComments = { id -> navController.navigate(Routes.comments(id)) },
                     // v27.5 修复：详情页内部跳转（相似推荐/作者其它作品/内嵌评论 JM 链接）失效。

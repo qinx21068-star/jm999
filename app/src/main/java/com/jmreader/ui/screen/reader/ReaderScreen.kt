@@ -1,4 +1,7 @@
-@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+@file:OptIn(
+    androidx.compose.material3.ExperimentalMaterial3Api::class,
+    androidx.compose.foundation.ExperimentalFoundationApi::class,
+)
 
 package com.jmreader.ui.screen.reader
 
@@ -6,6 +9,8 @@ import android.app.Activity
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.rememberTransformableState
+import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -54,6 +59,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -62,6 +68,8 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.view.WindowInsetsCompat
@@ -439,6 +447,24 @@ fun ReaderScreen(
 
     var uiVisible by remember { mutableStateOf(true) }
     var showLineSheet by remember { mutableStateOf(false) }
+    var contentScale by remember { mutableStateOf(1f) }
+    var contentOffset by remember { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
+    var viewportSize by remember { mutableStateOf(androidx.compose.ui.unit.IntSize.Zero) }
+    fun boundedOffset(offset: androidx.compose.ui.geometry.Offset, scale: Float): androidx.compose.ui.geometry.Offset {
+        val limitX = viewportSize.width * (scale - 1f) / 2f
+        val limitY = viewportSize.height * (scale - 1f) / 2f
+        return androidx.compose.ui.geometry.Offset(offset.x.coerceIn(-limitX, limitX), offset.y.coerceIn(-limitY, limitY))
+    }
+    val transformState = rememberTransformableState { zoomChange, panChange, _ ->
+        val nextScale = (contentScale * zoomChange).coerceIn(1f, 4f)
+        contentScale = nextScale
+        contentOffset = if (nextScale <= 1f) androidx.compose.ui.geometry.Offset.Zero
+            else boundedOffset(contentOffset + panChange, nextScale)
+    }
+    LaunchedEffect(state.imageFiles, pinchZoom) {
+        contentScale = 1f
+        contentOffset = androidx.compose.ui.geometry.Offset.Zero
+    }
     // 阅读进度恢复提示：进入章节自动滚到上次位置后，弹 snackbar 告知用户
     val jumpSnackbar = remember { androidx.compose.material3.SnackbarHostState() }
     val jumpScope = androidx.compose.runtime.rememberCoroutineScope()
@@ -650,7 +676,28 @@ fun ReaderScreen(
             }
         },
     ) { inner ->
-        Box(Modifier.fillMaxSize().padding(inner).background(Color.Black)) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .padding(inner)
+                .clipToBounds()
+                .onSizeChanged {
+                    viewportSize = it
+                    contentOffset = boundedOffset(contentOffset, contentScale)
+                }
+                .transformable(
+                    state = transformState,
+                    enabled = pinchZoom,
+                    canPan = { contentScale > 1f },
+                )
+                .background(Color.Black)
+                .graphicsLayer {
+                    scaleX = contentScale
+                    scaleY = contentScale
+                    translationX = contentOffset.x
+                    translationY = contentOffset.y
+                },
+        ) {
             // v27.5 稳定性加固：捕获 state 到本地 val，避免 `state.error != null` 通过后
             // 在另一线程写 StateFlow 时 state.error 变 null，下一行 `state.error!!` 抛 NPE。
             // collectAsState 的 by 委托每次访问都读最新 snapshot，单次 composition 内不保证一致。
@@ -715,9 +762,9 @@ fun ReaderScreen(
                         onTap = onTap,
                         onJumpNotice = onJumpNotice,
                         // v27.5 #1 #3 #5
-                        pinchZoom = pinchZoom,
-                        tapZoneMode = tapZoneMode,
-                        autoScroll = autoScroll,
+                        pinchZoom = false,
+                        tapZoneMode = if (contentScale > 1f) TapZoneMode.DISABLED else tapZoneMode,
+                        autoScroll = autoScroll && contentScale <= 1f,
                         autoScrollSpeed = autoScrollSpeed,
                         onZoneTap = { delta ->
                             // 横向阅读时点击区域翻页：delta=-1 上一页，+1 下一页
@@ -812,7 +859,7 @@ private fun ReaderPager(
             onPageChanged = onPageChanged,
             onTap = onTap,
             onJumpNotice = onJumpNotice,
-            pinchZoom = pinchZoom,
+            pinchZoom = false,
             autoScroll = autoScroll,
             autoScrollSpeed = autoScrollSpeed,
             readerFontSize = readerFontSize,
@@ -828,7 +875,7 @@ private fun ReaderPager(
                 onTap = onTap,
                 onJumpNotice = onJumpNotice,
                 reverse = direction == ReaderDirection.HORIZONTAL_RL,
-                pinchZoom = pinchZoom,
+                pinchZoom = false,
                 tapZoneMode = tapZoneMode,
                 onZoneTap = onZoneTap,
                 readerFontSize = readerFontSize,

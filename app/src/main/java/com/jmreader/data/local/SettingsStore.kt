@@ -106,7 +106,7 @@ data class AppSettings(
 
     // ============= v27.5 阅读器增强 =============
     /** 阅读器是否隐藏系统状态栏和导航栏。 */
-    val immersiveReader: Boolean = false,
+    val immersiveReader: Boolean = true,
     /** 章节内点击翻页模式（横向阅读时生效）。 */
     val tapZoneMode: TapZoneMode = TapZoneMode.THIRD_THIRD,
     /** 自动滚动（竖向阅读时按速度自动滚屏）。 */
@@ -116,8 +116,8 @@ data class AppSettings(
     /** 预加载下一章图片，避免翻章白屏。 */
     val preloadNextChapter: Boolean = true,
     /** Adaptive prefetch counts. Zero disables page prefetch on that network. */
-    val prefetchWifiPages: Int = 2,
-    val prefetchMobilePages: Int = 1,
+    val prefetchWifiPages: Int = 10,
+    val prefetchMobilePages: Int = 4,
     val prefetchDisableLowBattery: Boolean = true,
     val downloadWifiOnly: Boolean = false,
     val downloadChargingOnly: Boolean = false,
@@ -173,6 +173,8 @@ data class AppSettings(
     val saveSearchHistory: Boolean = true,
     /** 搜索结果按 tag 二次筛选（启用后搜索页显示 tag chips 二级过滤）。 */
     val searchTagFilter: Boolean = true,
+    /** 首页按已保存搜索模板的标签混合推荐。 */
+    val homeTagRecommendations: Boolean = true,
 
     // ============= v27.5 下载 =============
     /** 下载路径（外置 SD 卡 SAF URI，null=默认内部存储）。 */
@@ -263,6 +265,7 @@ class SettingsStore(private val context: Context, scope: CoroutineScope) {
         // v27.5 搜索
         val SAVE_SEARCH_HISTORY = booleanPreferencesKey("save_search_history_v27_5")
         val SEARCH_TAG_FILTER = booleanPreferencesKey("search_tag_filter_v27_5")
+        val HOME_TAG_RECOMMENDATIONS = booleanPreferencesKey("home_tag_recommendations_v1_3")
         // v27.5 下载
         val DOWNLOAD_DIR_URI = stringPreferencesKey("download_dir_uri_v27_5")
         val DOWNLOAD_CONCURRENCY = intPreferencesKey("download_concurrency_v27_5")
@@ -395,13 +398,13 @@ class SettingsStore(private val context: Context, scope: CoroutineScope) {
         backgroundImageBlur = p[Keys.BG_IMAGE_BLUR] ?: 0f,
         backgroundImageLightOnly = p[Keys.BG_IMAGE_LIGHT_ONLY] ?: true,
         // v27.5 阅读器
-        immersiveReader = p[Keys.IMMERSIVE_READER] ?: false,
+        immersiveReader = p[Keys.IMMERSIVE_READER] ?: true,
         tapZoneMode = runCatching { TapZoneMode.valueOf(p[Keys.TAP_ZONE_MODE] ?: "THIRD_THIRD") }.getOrDefault(TapZoneMode.THIRD_THIRD),
         autoScroll = p[Keys.AUTO_SCROLL] ?: false,
         autoScrollSpeed = p[Keys.AUTO_SCROLL_SPEED] ?: 5f,
         preloadNextChapter = p[Keys.PRELOAD_NEXT_CHAPTER] ?: true,
-        prefetchWifiPages = (p[Keys.PREFETCH_WIFI] ?: 2).coerceIn(0, 3),
-        prefetchMobilePages = (p[Keys.PREFETCH_MOBILE] ?: 1).coerceIn(0, 3),
+        prefetchWifiPages = (p[Keys.PREFETCH_WIFI] ?: 10).coerceIn(0, 10),
+        prefetchMobilePages = (p[Keys.PREFETCH_MOBILE] ?: 4).coerceIn(0, 4),
         prefetchDisableLowBattery = p[Keys.PREFETCH_LOW_BATTERY] ?: true,
         downloadWifiOnly = p[Keys.DOWNLOAD_WIFI_ONLY] ?: false,
         downloadChargingOnly = p[Keys.DOWNLOAD_CHARGING_ONLY] ?: false,
@@ -430,6 +433,7 @@ class SettingsStore(private val context: Context, scope: CoroutineScope) {
         // v27.5 搜索
         saveSearchHistory = p[Keys.SAVE_SEARCH_HISTORY] ?: true,
         searchTagFilter = p[Keys.SEARCH_TAG_FILTER] ?: true,
+        homeTagRecommendations = p[Keys.HOME_TAG_RECOMMENDATIONS] ?: true,
         // v27.5 下载
         downloadDirUri = p[Keys.DOWNLOAD_DIR_URI],
         downloadConcurrency = (p[Keys.DOWNLOAD_CONCURRENCY] ?: 2).coerceIn(1, 4),
@@ -444,7 +448,7 @@ class SettingsStore(private val context: Context, scope: CoroutineScope) {
         readLaterNotificationEnabled = p[Keys.READ_LATER_NOTIFICATION] ?: false,
     )
 
-    private val portablePreferenceNames = setOf("server_url", "theme", "reader_dir", "dynamic_color", "custom_api_domains", "max_refresh_rate", "disclaimer_accepted", "list_style", "volume_key_paging", "color_scheme_id_v27_4", "custom_colors_v27_4", "bg_image_opacity_v27_4", "bg_image_blur_v27_4", "bg_image_light_only_v27_4", "immersive_reader_v1_3", "tap_zone_mode_v27_5", "auto_scroll_v27_5", "auto_scroll_speed_v27_5", "preload_next_ch_v27_5", "prefetch_wifi_v1_3", "prefetch_mobile_v1_3", "prefetch_low_battery_v1_3", "download_wifi_only_v1_3", "download_charging_only_v1_3", "ui_animations_v1_3", "pinch_zoom_v27_5", "remember_page_level_v27_5", "reader_font_size_v27_5", "reader_line_spacing_v27_5", "night_mode_filter_v27_5", "night_mode_filter_strength_v27_5", "card_corner_radius_v27_5", "card_elevation_v27_5", "corner_mode_v27_5", "list_title_font_v27_5", "list_body_font_v27_5", "cover_aspect_v27_5", "tab_bar_style_v27_5", "detail_parallax_v27_5", "splash_anim_v27_5", "incognito_v27_5", "block_screenshots_v27_5", "save_search_history_v27_5", "search_tag_filter_v27_5", "download_concurrency_v27_5", "local_search_v27_5", "image_quality_v27_5", "ranking_period_v27_5", "block_mode")
+    private val portablePreferenceNames = setOf("server_url", "theme", "reader_dir", "dynamic_color", "custom_api_domains", "max_refresh_rate", "disclaimer_accepted", "list_style", "volume_key_paging", "color_scheme_id_v27_4", "custom_colors_v27_4", "bg_image_opacity_v27_4", "bg_image_blur_v27_4", "bg_image_light_only_v27_4", "immersive_reader_v1_3", "tap_zone_mode_v27_5", "auto_scroll_v27_5", "auto_scroll_speed_v27_5", "preload_next_ch_v27_5", "prefetch_wifi_v1_3", "prefetch_mobile_v1_3", "prefetch_low_battery_v1_3", "download_wifi_only_v1_3", "download_charging_only_v1_3", "ui_animations_v1_3", "pinch_zoom_v27_5", "remember_page_level_v27_5", "reader_font_size_v27_5", "reader_line_spacing_v27_5", "night_mode_filter_v27_5", "night_mode_filter_strength_v27_5", "card_corner_radius_v27_5", "card_elevation_v27_5", "corner_mode_v27_5", "list_title_font_v27_5", "list_body_font_v27_5", "cover_aspect_v27_5", "tab_bar_style_v27_5", "detail_parallax_v27_5", "splash_anim_v27_5", "home_tag_recommendations_v1_3", "incognito_v27_5", "block_screenshots_v27_5", "save_search_history_v27_5", "search_tag_filter_v27_5", "download_concurrency_v27_5", "local_search_v27_5", "image_quality_v27_5", "ranking_period_v27_5", "block_mode")
 
     /** Portable preferences omit authentication, app-lock secrets and device-local URI grants. */
     suspend fun exportPortable(): org.json.JSONObject {
@@ -466,7 +470,7 @@ class SettingsStore(private val context: Context, scope: CoroutineScope) {
         return out
     }
 
-    private val portablePreferenceTypes = mapOf("server_url" to "string", "theme" to "string", "reader_dir" to "string", "dynamic_color" to "boolean", "logged_user" to "string", "last_comic" to "string", "last_chapter" to "string", "last_page" to "int", "custom_api_domains" to "set", "max_refresh_rate" to "boolean", "disclaimer_accepted" to "boolean", "list_style" to "string", "volume_key_paging" to "boolean", "color_scheme_id_v27_4" to "string", "custom_colors_v27_4" to "string", "bg_image_uri_v27_4" to "string", "bg_image_opacity_v27_4" to "float", "bg_image_blur_v27_4" to "float", "bg_image_light_only_v27_4" to "boolean", "immersive_reader_v1_3" to "boolean", "tap_zone_mode_v27_5" to "string", "auto_scroll_v27_5" to "boolean", "auto_scroll_speed_v27_5" to "float", "preload_next_ch_v27_5" to "boolean", "prefetch_wifi_v1_3" to "int", "prefetch_mobile_v1_3" to "int", "prefetch_low_battery_v1_3" to "boolean", "download_wifi_only_v1_3" to "boolean", "download_charging_only_v1_3" to "boolean", "ui_animations_v1_3" to "boolean", "remember_page_level_v27_5" to "boolean", "reader_font_size_v27_5" to "float", "reader_line_spacing_v27_5" to "float", "pinch_zoom_v27_5" to "boolean", "night_mode_filter_v27_5" to "boolean", "night_mode_filter_strength_v27_5" to "float", "card_corner_radius_v27_5" to "float", "card_elevation_v27_5" to "float", "corner_mode_v27_5" to "string", "list_title_font_v27_5" to "float", "list_body_font_v27_5" to "float", "cover_aspect_v27_5" to "string", "tab_bar_style_v27_5" to "string", "detail_parallax_v27_5" to "boolean", "splash_anim_v27_5" to "boolean", "app_lock_v27_5" to "boolean", "app_lock_pin_v27_5" to "string", "incognito_v27_5" to "boolean", "block_screenshots_v27_5" to "boolean", "save_search_history_v27_5" to "boolean", "search_tag_filter_v27_5" to "boolean", "download_dir_uri_v27_5" to "string", "download_concurrency_v27_5" to "int", "local_search_v27_5" to "boolean", "image_quality_v27_5" to "string", "pinned_image_cdn_v27_5" to "string", "proxy_v27_5" to "string", "ranking_period_v27_5" to "string", "block_mode" to "string", "read_later_notification_v27_15" to "boolean")
+    private val portablePreferenceTypes = mapOf("server_url" to "string", "theme" to "string", "reader_dir" to "string", "dynamic_color" to "boolean", "logged_user" to "string", "last_comic" to "string", "last_chapter" to "string", "last_page" to "int", "custom_api_domains" to "set", "max_refresh_rate" to "boolean", "disclaimer_accepted" to "boolean", "list_style" to "string", "volume_key_paging" to "boolean", "color_scheme_id_v27_4" to "string", "custom_colors_v27_4" to "string", "bg_image_uri_v27_4" to "string", "bg_image_opacity_v27_4" to "float", "bg_image_blur_v27_4" to "float", "bg_image_light_only_v27_4" to "boolean", "immersive_reader_v1_3" to "boolean", "tap_zone_mode_v27_5" to "string", "auto_scroll_v27_5" to "boolean", "auto_scroll_speed_v27_5" to "float", "preload_next_ch_v27_5" to "boolean", "prefetch_wifi_v1_3" to "int", "prefetch_mobile_v1_3" to "int", "prefetch_low_battery_v1_3" to "boolean", "download_wifi_only_v1_3" to "boolean", "download_charging_only_v1_3" to "boolean", "ui_animations_v1_3" to "boolean", "remember_page_level_v27_5" to "boolean", "reader_font_size_v27_5" to "float", "reader_line_spacing_v27_5" to "float", "pinch_zoom_v27_5" to "boolean", "night_mode_filter_v27_5" to "boolean", "night_mode_filter_strength_v27_5" to "float", "card_corner_radius_v27_5" to "float", "card_elevation_v27_5" to "float", "corner_mode_v27_5" to "string", "list_title_font_v27_5" to "float", "list_body_font_v27_5" to "float", "cover_aspect_v27_5" to "string", "tab_bar_style_v27_5" to "string", "detail_parallax_v27_5" to "boolean", "splash_anim_v27_5" to "boolean", "app_lock_v27_5" to "boolean", "app_lock_pin_v27_5" to "string", "incognito_v27_5" to "boolean", "block_screenshots_v27_5" to "boolean", "save_search_history_v27_5" to "boolean", "search_tag_filter_v27_5" to "boolean", "home_tag_recommendations_v1_3" to "boolean", "download_dir_uri_v27_5" to "string", "download_concurrency_v27_5" to "int", "local_search_v27_5" to "boolean", "image_quality_v27_5" to "string", "pinned_image_cdn_v27_5" to "string", "proxy_v27_5" to "string", "ranking_period_v27_5" to "string", "block_mode" to "string", "read_later_notification_v27_15" to "boolean")
 
     fun validatePortable(data: org.json.JSONObject) {
         data.keys().forEach { name ->
@@ -475,7 +479,15 @@ class SettingsStore(private val context: Context, scope: CoroutineScope) {
             require(item.getString("type") == portablePreferenceTypes[name]) { "设置类型不匹配：$name" }
             when (item.getString("type")) {
                 "boolean" -> item.getBoolean("value")
-                "int" -> { val value = item.getInt("value"); require(if (name.startsWith("prefetch_")) value in 0..3 else value in 1..4) }
+                "int" -> {
+                    val value = item.getInt("value")
+                    val valid = when (name) {
+                        "prefetch_wifi_v1_3" -> value in 0..10
+                        "prefetch_mobile_v1_3" -> value in 0..4
+                        else -> value in 1..4
+                    }
+                    require(valid)
+                }
                 "float" -> {
                     val value = item.getDouble("value")
                     require(value.isFinite())
@@ -574,8 +586,8 @@ class SettingsStore(private val context: Context, scope: CoroutineScope) {
     suspend fun setAutoScroll(v: Boolean) = context.dataStore.edit { it[Keys.AUTO_SCROLL] = v }
     suspend fun setAutoScrollSpeed(v: Float) = context.dataStore.edit { it[Keys.AUTO_SCROLL_SPEED] = v.coerceIn(1f, 30f) }
     suspend fun setPreloadNextChapter(v: Boolean) = context.dataStore.edit { it[Keys.PRELOAD_NEXT_CHAPTER] = v }
-    suspend fun setPrefetchWifiPages(v: Int) = context.dataStore.edit { it[Keys.PREFETCH_WIFI] = v.coerceIn(0, 3) }
-    suspend fun setPrefetchMobilePages(v: Int) = context.dataStore.edit { it[Keys.PREFETCH_MOBILE] = v.coerceIn(0, 3) }
+    suspend fun setPrefetchWifiPages(v: Int) = context.dataStore.edit { it[Keys.PREFETCH_WIFI] = v.coerceIn(0, 10) }
+    suspend fun setPrefetchMobilePages(v: Int) = context.dataStore.edit { it[Keys.PREFETCH_MOBILE] = v.coerceIn(0, 4) }
     suspend fun setPrefetchDisableLowBattery(v: Boolean) = context.dataStore.edit { it[Keys.PREFETCH_LOW_BATTERY] = v }
     suspend fun setDownloadWifiOnly(v: Boolean) = context.dataStore.edit { it[Keys.DOWNLOAD_WIFI_ONLY] = v }
     suspend fun setDownloadChargingOnly(v: Boolean) = context.dataStore.edit { it[Keys.DOWNLOAD_CHARGING_ONLY] = v }
@@ -608,6 +620,7 @@ class SettingsStore(private val context: Context, scope: CoroutineScope) {
     // 搜索
     suspend fun setSaveSearchHistory(v: Boolean) = context.dataStore.edit { it[Keys.SAVE_SEARCH_HISTORY] = v }
     suspend fun setSearchTagFilter(v: Boolean) = context.dataStore.edit { it[Keys.SEARCH_TAG_FILTER] = v }
+    suspend fun setHomeTagRecommendations(v: Boolean) = context.dataStore.edit { it[Keys.HOME_TAG_RECOMMENDATIONS] = v }
     // 下载
     suspend fun setDownloadDirUri(uri: String?) = context.dataStore.edit {
         if (uri == null) it.remove(Keys.DOWNLOAD_DIR_URI) else it[Keys.DOWNLOAD_DIR_URI] = uri

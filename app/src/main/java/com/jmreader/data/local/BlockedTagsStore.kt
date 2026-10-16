@@ -27,6 +27,9 @@ import kotlinx.coroutines.flow.map
 private val Context.blockedTagsStore by preferencesDataStore(name = "blocked_tags")
 
 class BlockedTagsStore(private val context: Context) {
+    private companion object {
+        val DEFAULT_TAGS = setOf("ntr", "NTR")
+    }
     private val tagKey = stringSetPreferencesKey("tags")
     private val nameKey = stringSetPreferencesKey("names")
     private val authorKey = stringSetPreferencesKey("authors")
@@ -40,8 +43,11 @@ class BlockedTagsStore(private val context: Context) {
             emit(emptyPreferences())
         }
 
-    /** 被屏蔽的 tag 集合。 */
-    val tags: Flow<Set<String>> = safeData.map { it[tagKey] ?: emptySet() }
+    /**
+     * 被屏蔽的 tag 集合。首次使用默认加入 NTR/ntr；用户删除后会持久化空集合，
+     * 不会在每次读取时重新添加。
+     */
+    val tags: Flow<Set<String>> = safeData.map { it[tagKey] ?: DEFAULT_TAGS }
 
     /** 被屏蔽的名称关键词集合。 */
     val names: Flow<Set<String>> = safeData.map { it[nameKey] ?: emptySet() }
@@ -53,7 +59,7 @@ class BlockedTagsStore(private val context: Context) {
     val enabled: Flow<Boolean> = safeData.map { it[enabledKey] ?: true }
     val allRules: Flow<Triple<Set<String>, Set<String>, Set<String>>> = safeData.map { prefs ->
         if (prefs[enabledKey] == false) Triple(emptySet(), emptySet(), emptySet())
-        else Triple(prefs[tagKey].orEmpty(), prefs[nameKey].orEmpty(), prefs[authorKey].orEmpty())
+        else Triple(prefs[tagKey] ?: DEFAULT_TAGS, prefs[nameKey].orEmpty(), prefs[authorKey].orEmpty())
     }
     val configuredRules: Flow<Triple<Set<String>, Set<String>, Set<String>>> =
         combine(tags, names, authors) { t, n, a -> Triple(t, n, a) }
@@ -65,7 +71,7 @@ class BlockedTagsStore(private val context: Context) {
             val cleanTags = rules.first.filter { it.isNotBlank() }.toSet()
             val cleanNames = rules.second.filter { it.isNotBlank() }.toSet()
             val cleanAuthors = rules.third.filter { it.isNotBlank() }.toSet()
-            prefs[tagKey] = (if (merge) prefs[tagKey].orEmpty() else emptySet()) + cleanTags
+            prefs[tagKey] = (if (merge) (prefs[tagKey] ?: DEFAULT_TAGS) else emptySet()) + cleanTags
             prefs[nameKey] = (if (merge) prefs[nameKey].orEmpty() else emptySet()) + cleanNames
             prefs[authorKey] = (if (merge) prefs[authorKey].orEmpty() else emptySet()) + cleanAuthors
         }
@@ -75,7 +81,7 @@ class BlockedTagsStore(private val context: Context) {
         val t = tag.trim()
         if (t.isEmpty()) return
         context.blockedTagsStore.edit { prefs ->
-            prefs[tagKey] = (prefs[tagKey] ?: emptySet()) + t
+            prefs[tagKey] = (prefs[tagKey] ?: DEFAULT_TAGS) + t
         }
     }
 
@@ -83,7 +89,7 @@ class BlockedTagsStore(private val context: Context) {
         // 与 addTag 对称：trim 后再删除。否则传入 " NTR " 删不掉集合里的 "NTR"。
         val t = tag.trim()
         context.blockedTagsStore.edit { prefs ->
-            prefs[tagKey] = (prefs[tagKey] ?: emptySet()) - t
+            prefs[tagKey] = (prefs[tagKey] ?: DEFAULT_TAGS).filterNot { it.equals(t, ignoreCase = true) }.toSet()
         }
     }
 

@@ -24,6 +24,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.NavigateBefore
+import androidx.compose.material.icons.automirrored.outlined.NavigateNext
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.ImageSearch
 import androidx.compose.material.icons.outlined.Search
@@ -43,6 +45,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -83,6 +86,9 @@ private val ORDERS = listOf(
     Order("picture", "图片数"),
 )
 
+private const val SEARCH_BATCH_SIZE = 80
+private const val SEARCH_MAX_SOURCE_PAGES = 16
+
 class SearchViewModel(container: AppContainer) : BaseListViewModel(container) {
     var query by mutableStateOf("")
         private set
@@ -97,24 +103,28 @@ class SearchViewModel(container: AppContainer) : BaseListViewModel(container) {
      * 避免旧 searchBatch 完成后调用 setBatchResult 覆盖新结果（竞态）。
      */
     private var searchBatchJob: Job? = null
+    private var pageNavigationJob: Job? = null
+    private val batchPager = SearchBatchPager(SEARCH_BATCH_SIZE, SEARCH_MAX_SOURCE_PAGES)
+    private var historyJob: Job? = null
+    var pageNavigationVersion by mutableIntStateOf(0)
+        private set
+
+    private fun resetSourcePages() = batchPager.reset()
 
     fun onQueryChange(q: String) {
+        if (q == query) return
+        clearList()
+        historyJob?.cancel()
+        searchBatchJob?.cancel()
+        resetSourcePages()
         query = q
+        pageNavigationJob?.cancel()
         debounce?.cancel()
         // 空关键词不发起请求，直接清空列表回到初始态，避免无意义转圈
         if (q.isBlank()) {
             batchMode = false
             // 取消尚未完成的批量搜索，避免清空后又写回旧批量结果
             searchBatchJob?.cancel()
-            _state.value = _state.value.copy(
-                items = emptyList(),
-                refreshing = false,
-                loadingMore = false,
-                error = null,
-                page = 1,
-                endReached = false,
-                coverHiddenIds = emptySet(),
-            )
             return
         }
         debounce = viewModelScope.launch {
@@ -139,7 +149,13 @@ class SearchViewModel(container: AppContainer) : BaseListViewModel(container) {
 
     /** 直接用历史词搜索（点击历史词条触发，立即搜索并存历史）。 */
     fun searchDirect(q: String) {
+        cancelAllLoadingJobs()
+        historyJob?.cancel()
+        searchBatchJob?.cancel()
+        resetSourcePages()
+
         query = q
+        pageNavigationJob?.cancel()
         debounce?.cancel()
         // v27.14：批量 ID 搜索（输入多个 JM 号，空格/逗号/句号分隔）
         val batchIds = parseBatchIds(q)
@@ -152,7 +168,7 @@ class SearchViewModel(container: AppContainer) : BaseListViewModel(container) {
             batchMode = false
             searchBatchJob?.cancel()
         }
-        viewModelScope.launch {
+        historyJob = viewModelScope.launch {
             // v27.5 稳定性加固：DataStore 读盘/写盘可能抛 IOException，未捕获会冒泡到
             // Thread.uncaughtExceptionHandler → CrashHandler → 杀进程。整段包 try-catch，
             // 失败仍触发 refresh，让用户至少能看到搜索结果（只是没存进历史）。
@@ -179,6 +195,9 @@ class SearchViewModel(container: AppContainer) : BaseListViewModel(container) {
     fun onOrderChange(o: String) {
         // v27.14：批量模式下排序无意义（结果固定无分页），直接忽略
         if (batchMode) return
+        pageNavigationJob?.cancel()
+        historyJob?.cancel()
+        resetSourcePages()
         order = o
         debounce?.cancel()   // 取消尚未触发的输入 debounce，避免与本次 refresh 并发
         refresh()
@@ -190,6 +209,7 @@ class SearchViewModel(container: AppContainer) : BaseListViewModel(container) {
      * - 普通模式下：等价于 refresh()。
      */
     fun retrySearch() {
+        pageNavigationJob?.cancel()
         if (batchMode) {
             val ids = parseBatchIds(query) ?: run {
                 // 异常状态：batchMode=true 但 query 不是批量格式，回退到普通搜索
@@ -238,6 +258,8 @@ class SearchViewModel(container: AppContainer) : BaseListViewModel(container) {
      * @param saveHistory true=记录搜索历史（用户主动触发时）
      */
     private fun searchBatch(ids: List<String>, saveHistory: Boolean) {
+        cancelAllLoadingJobs()
+        pageNavigationJob?.cancel()
         query = ids.joinToString(" ")
         batchMode = true
         debounce?.cancel()
@@ -259,12 +281,15 @@ class SearchViewModel(container: AppContainer) : BaseListViewModel(container) {
             }
         }
         searchBatchJob = viewModelScope.launch {
+            resetSourcePages()
             _state.value = _state.value.copy(
                 refreshing = true,
                 error = null,
                 page = 1,
+                loadedCount = 0,
                 endReached = false,
                 items = emptyList(),
+                total = null,
                 coverHiddenIds = emptySet(),
             )
             try {
@@ -278,7 +303,9 @@ class SearchViewModel(container: AppContainer) : BaseListViewModel(container) {
                                         .let { (it as? Resource.Success)?.data }
                                 }
                                 id to detail
-                            } catch (_: Throwable) {
+                            } catch (e: kotlinx.coroutines.CancellationException) {
+                                throw e
+                            } catch (_: Exception) {
                                 id to null
                             }
                         }
@@ -324,35 +351,60 @@ class SearchViewModel(container: AppContainer) : BaseListViewModel(container) {
         }
     }
 
-    override suspend fun loadPage(page: Int): Resource<Pair<List<ComicBriefDto>, Int?>> {
-        // v27.14：批量模式下不分页（setBatchResult 已设 endReached=true，loadMore 不会触发，
-        // 但为防御性编程，这里直接返回空成功结果）
-        if (batchMode) {
-            return Resource.Success(emptyList<ComicBriefDto>() to _state.value.total)
-        }
-        val r = container.repository.search(query, page, order)
-        return when (r) {
-            is Resource.Success -> {
-                // 关键修复（Bug 48）：偶尔禁漫 API 会因域名抖动/限流返回空列表（code=200 但 content=[]），
-                // 用户表现为"搜索不出结果"。首次为空且 query 非空时自动重试一次（短暂延迟后换域名再请求）。
-                // 仅首页重试：翻页返回空可能是真的没数据，不应误重试。
-                if (page == 1 && r.data.items.isEmpty() && query.isNotBlank() && r.data.total != 0) {
-                    Logger.w("Search", "首页搜索返回空，800ms 后重试一次")
-                    kotlinx.coroutines.delay(800)
-                    // reqApi 内部已会自动轮换域名重试，这里直接发第二次请求即可。
-                    when (val r2 = container.repository.search(query, page, order)) {
-                        is Resource.Success -> Resource.Success(r2.data.items to r2.data.total)
-                        is Resource.Error -> r2
-                        Resource.Loading -> Resource.Loading
+    fun goToPage(target: Int) {
+        if (batchMode || query.isBlank() || _state.value.refreshing || _state.value.loadingMore || target < 1 || target == _state.value.page) return
+        cancelAllLoadingJobs()
+        pageNavigationJob?.cancel()
+        pageNavigationJob = viewModelScope.launch {
+            _state.value = _state.value.copy(refreshing = true, error = null)
+            try {
+                when (val result = loadPage(target)) {
+                    is Resource.Success -> {
+                        replacePageResult(
+                            page = target,
+                            items = result.data.first,
+                            total = result.data.second,
+                            endReached = result.data.first.isEmpty() || batchPager.isTerminal(target),
+                            loadedCountForState = loadedRawCountThrough(target),
+                        )
+                        pageNavigationVersion++
                     }
-                } else {
-                    Resource.Success(r.data.items to r.data.total)
+                    is Resource.Error -> _state.value = _state.value.copy(refreshing = false, error = Logger.friendlyError(result.message))
+                    Resource.Loading -> _state.value = _state.value.copy(refreshing = false)
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                _state.value = _state.value.copy(refreshing = false, error = Logger.friendlyError(Logger.brief(e)))
             }
-            is Resource.Error -> r
+        }
+    }
+
+    fun loadedRawCountThrough(batch: Int): Int =
+        if (batchMode) _state.value.loadedCount else batchPager.loadedCountThrough(batch)
+
+    override fun isTerminalPage(page: Int): Boolean = batchMode || batchPager.isTerminal(page)
+
+    override suspend fun loadPage(page: Int): Resource<Pair<List<ComicBriefDto>, Int?>> {
+        if (batchMode) return Resource.Success(emptyList<ComicBriefDto>() to _state.value.total)
+        val requestQuery = query
+        val requestOrder = order
+        if (requestQuery.isBlank()) return Resource.Success(emptyList<ComicBriefDto>() to 0)
+        if (page == 1) batchPager.reset()
+        return when (val result = batchPager.load(page) { sourcePage ->
+            var response = container.repository.search(requestQuery, sourcePage, requestOrder)
+            if (sourcePage == 1 && response is Resource.Success && response.data.items.isEmpty() && response.data.total != 0) {
+                delay(800L)
+                response = container.repository.search(requestQuery, sourcePage, requestOrder)
+            }
+            response
+        }) {
+            is Resource.Success -> Resource.Success(result.data.items to result.data.total)
+            is Resource.Error -> result
             Resource.Loading -> Resource.Loading
         }
     }
+
 }
 
 class SearchVMFactory(private val container: AppContainer) : ViewModelProvider.Factory {
@@ -519,6 +571,7 @@ fun SearchScreen(
     // 避免 state 在"有结果"和"加载中"之间切换时 rememberSaveable 丢失值导致列表跳回顶部。
     var lastScrolledQuery by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf("") }
     var lastScrolledOrder by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf("") }
+    var lastNavigationVersion by remember { mutableIntStateOf(vm.pageNavigationVersion) }
 
     // 用 Box 包裹以承载 SnackbarHost：长按屏蔽/收藏操作需要反馈
     Box(Modifier.fillMaxSize()) {
@@ -556,6 +609,27 @@ fun SearchScreen(
                 }
             }),
         )
+        if (vm.query.isNotBlank() && state.loadedCount > 0) Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "已加载 ${vm.loadedRawCountThrough(state.page)}/${state.total ?: "?"} 本 · 第 ${state.page} 批",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
+            )
+            IconButton(
+                onClick = { vm.goToPage(state.page - 1) },
+                enabled = state.page > 1 && !state.refreshing && !state.loadingMore,
+                modifier = Modifier.size(32.dp),
+            ) { Icon(Icons.AutoMirrored.Outlined.NavigateBefore, contentDescription = "上一批") }
+            IconButton(
+                onClick = { vm.goToPage(state.page + 1) },
+                enabled = !state.endReached && !state.refreshing && !state.loadingMore,
+                modifier = Modifier.size(32.dp),
+            ) { Icon(Icons.AutoMirrored.Outlined.NavigateNext, contentDescription = "下一批") }
+        }
         // v27.6：历史/热门/排序chips/tag chips 作为 ComicList 的 header，随列表滚动移出视野
         // 搜索框保持固定（用户需要随时看到搜索框）
         val searchHeader: @androidx.compose.runtime.Composable () -> Unit = {
@@ -700,13 +774,14 @@ fun SearchScreen(
                     // 新搜索/换排序后结果刷新，滚回顶部。
                     // 仅在 query 或 order 变化时才滚到顶部，从详情页返回时不滚。
                     // lastScrolledQuery/Order 已提到 when 分支外（Bug 11 修复）。
-                    LaunchedEffect(s.items.firstOrNull()?.id) {
+                    LaunchedEffect(s.items.firstOrNull()?.id, vm.pageNavigationVersion) {
                         if (!s.refreshing && s.items.isNotEmpty() &&
-                            (lastScrolledQuery != vm.query || lastScrolledOrder != vm.order)) {
+                            (lastScrolledQuery != vm.query || lastScrolledOrder != vm.order || lastNavigationVersion != vm.pageNavigationVersion)) {
                             lastScrolledQuery = vm.query
                             lastScrolledOrder = vm.order
+                            lastNavigationVersion = vm.pageNavigationVersion
                             // 关键修复（Bug 40）：网格模式用 gridState 滚顶，列表模式用 listState。
-                            if (listStyle == com.jmreader.data.local.ListStyle.LIST) {
+                            if (listStyle == com.jmreader.data.local.ListStyle.LIST || listStyle == com.jmreader.data.local.ListStyle.CARD) {
                                 listState.scrollToItem(0)
                             } else {
                                 gridState.scrollToItem(0)

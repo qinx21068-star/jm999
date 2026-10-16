@@ -14,7 +14,10 @@ import com.jmreader.data.api.direct.executeCancellable
 import com.jmreader.data.repository.Resource
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.flow.first
@@ -88,8 +91,56 @@ fun NetworkDiagnosticsDialog(container: AppContainer, onDismiss: () -> Unit) {
     val scope = rememberCoroutineScope()
     val settings by container.settingsStore.settings.collectAsState()
     var comicId by remember { mutableStateOf("") }
-    var report by remember { mutableStateOf("选择接口或图片测试。图片测速读取真实封面的前 64 KB，不代表完整图片吞吐。") }
+    var report by remember { mutableStateOf("选择接口、单张图片或全部图片 CDN 测试。") }
     var busy by remember { mutableStateOf(false) }
+    fun runImageCdnTest() {
+        if (busy) return
+        busy = true
+        scope.launch {
+            try {
+                val id = comicId.trim()
+                require(id.isNotBlank()) { "图片 CDN 测试需要漫画 ID" }
+                val results = withTimeout(25_000) {
+                    withContext(Dispatchers.IO) {
+                        kotlinx.coroutines.coroutineScope {
+                            val semaphore = kotlinx.coroutines.sync.Semaphore(4)
+                            container.directClient.imageDomainList().map { host ->
+                                async {
+                                    semaphore.withPermit {
+                                        val (latency, error) = container.directClient.testImageDomain(host, id)
+                                        Triple(host, latency, error)
+                                    }
+                                }
+                            }.awaitAll()
+                        }
+                    }
+                }
+                val usable = results.filter { it.second != null && it.third == null }.sortedBy { it.second }
+                if (usable.isNotEmpty()) {
+                    val fastest = usable.first().first
+                    container.settingsStore.setPinnedImageCdn(fastest)
+                    container.directClient.setPinnedImageCdn(fastest)
+                    container.directClient.selectImageDomain(fastest)
+
+                    report = buildString {
+                        append("最快线路：$fastest · ${usable.first().second} ms\n")
+                        append("已保存并优先使用该直连图片线路；后端代理链路需另测。\n\n")
+                        results.sortedWith(compareBy({ it.third != null }, { it.second ?: Long.MAX_VALUE }))
+                            .joinTo(this, separator = "\n") { (host, latency, error) ->
+                                val latencyText = latency?.let { "$it ms" } ?: "失败"
+                                val errorText = error?.let { " ($it)" } ?: ""
+                                "$host · $latencyText$errorText"
+                            }
+                    }
+                } else {
+                    report = "没有可用图片 CDN：\n" + results.joinToString("\n") { (host, _, error) -> "$host · ${error ?: "失败"}" }
+                }
+            } catch (e: kotlinx.coroutines.TimeoutCancellationException) { report = "图片 CDN 测试超时" }
+            catch (e: CancellationException) { throw e }
+            catch (e: Throwable) { report = "图片 CDN 测试失败：${e.message}" }
+            finally { busy = false }
+        }
+    }
     fun run(images: Boolean) {
         if (busy) return
         busy = true
@@ -141,8 +192,10 @@ fun NetworkDiagnosticsDialog(container: AppContainer, onDismiss: () -> Unit) {
                     OutlinedButton(enabled = !busy, onClick = { run(false) }) { Text("接口测试") }
                     OutlinedButton(enabled = !busy, onClick = { run(true) }) { Text("图片测试") }
                 }
+                OutlinedButton(enabled = !busy, onClick = { runImageCdnTest() }) { Text("测速 CDN 并应用最快线路") }
                 if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
                 Text(report, style = MaterialTheme.typography.bodySmall)
+
             }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
