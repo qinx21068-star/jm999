@@ -50,13 +50,18 @@ import androidx.navigation.NavController
 import com.jmreader.data.AppContainer
 import com.jmreader.data.dto.FavoriteEntry
 import com.jmreader.data.local.FavoritesStore
+import com.jmreader.data.local.needsMetadataEnrichment
 import com.jmreader.ui.components.ComicList
 import com.jmreader.ui.components.EmptyBox
 import com.jmreader.ui.components.FavoriteFolderManageDialog
 import com.jmreader.ui.components.LoadingBox
 import com.jmreader.ui.components.rememberBlockAction
 import com.jmreader.ui.nav.Routes
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import java.util.concurrent.atomic.AtomicInteger
 
 @Composable
 fun FavoritesScreen(container: AppContainer, navController: NavController) {
@@ -83,27 +88,84 @@ fun FavoritesScreen(container: AppContainer, navController: NavController) {
     val rules = remember(rulesTriple) {
         container.blockedTagsStore.normalizeRules(rulesTriple.first, rulesTriple.second, rulesTriple.third)
     }
-    // v27.6：异步补全本地收藏/历史中 tags 为空的条目
-    // 缓存的 tags 可能是列表 API 的粗分类版本（收藏时未经过详情页），补全后屏蔽过滤更准确
+    // v27.16：异步补全本地收藏 / 浏览历史 / 阅读历史中「缺失」的元数据。
+    //
+    // 相对旧实现的改动（旧实现只把补到的 tags 放进内存 map，仅用于屏蔽过滤，且串行、不落盘）：
+    // 1. 补的字段从「只有 tags」扩展到「publishTime + 作者 + 真实 tags + 观看/喜欢 + 封面」→
+    //    卡片才能显示真实发布日期与 JM 号（数据来自详情接口，缺失则保留 null，不造值）；
+    // 2. 结果**落盘**到三个 Store（本地收藏优先），卡片不用等下次冷启动就能刷新；
+    // 3. 串行 forEach → 信号量限流的适量并发；
+    // 4. 每轮适量补全，本次进入最多尝试 90 本；离开页面停止，避免持续扫全库；
+    //    协程挂在 LaunchedEffect 上，离开收藏页即取消（可取消）。
+    //
+    // 触发键用「各列表 size」而非整个列表：补全落盘不改变 size，因此不会自我触发重启；
+    // 用户新增/删除收藏导致 size 变化时才重启，顺带补上新条目。
     val enrichedLocalTags = remember { mutableStateMapOf<String, List<String>>() }
     var enrichVersion by remember { mutableIntStateOf(0) }
-    LaunchedEffect(localEntriesRaw, browseHistoryRaw) {
-        val allEntries = (localEntriesRaw.map { it.comic } + browseHistoryRaw.map { it.comic })
-            .distinctBy { it.id }
-            .filter { it.tags.isEmpty() && it.id !in enrichedLocalTags }
-            .take(30)
-        allEntries.forEach { comic ->
-            try {
-                when (val r = container.repository.comicDetail(comic.id)) {
-                    is com.jmreader.data.repository.Resource.Success -> {
-                        r.data.tags.takeIf { it.isNotEmpty() }?.let {
-                            enrichedLocalTags[comic.id] = it
-                            enrichVersion++
+    // 记录本次进入页面已尝试过的 id（无论成败），避免对「永远补不全 / 网络一直失败」的条目死循环。
+    val enrichAttemptedIds = remember { mutableSetOf<String>() }
+    LaunchedEffect(localEntriesRaw.size, browseHistoryRaw.size, readingHistory.size) {
+        container.favoritesStore.ensureLoaded()
+        container.browseHistoryStore.ensureLoaded()
+        container.historyStore.ensureLoaded()
+        val semaphore = Semaphore(ENRICH_CONCURRENCY)
+        while (enrichAttemptedIds.size < 90) {
+            // 每轮重新读取 Store 最新值：条目可能已被用户删除/修改，避免对旧快照做事。
+            val favComics = container.favoritesStore.entries.value.map { it.comic }
+            val browseComics = container.browseHistoryStore.items.value.map { it.comic }
+            val readComics = container.historyStore.items.value.map { it.comic }
+            // 本地收藏优先，其次浏览历史、阅读历史；同一 id 只处理一次（需求：优先本地收藏补全）。
+            val candidates = LinkedHashMap<String, com.jmreader.data.dto.ComicBriefDto>()
+            (favComics + browseComics + readComics).forEach { c ->
+                if (c.id.isNotBlank() && c.needsMetadataEnrichment() && c.id !in enrichAttemptedIds) {
+                    candidates.putIfAbsent(c.id, c)
+                }
+            }
+            val batch = candidates.values.take(minOf(ENRICH_BATCH_SIZE, 90 - enrichAttemptedIds.size))
+            if (batch.isEmpty()) break
+            val succeeded = AtomicInteger(0)
+            coroutineScope {
+                batch.forEach { comic ->
+                    launch {
+                        semaphore.withPermit {
+                            enrichAttemptedIds.add(comic.id)
+                            // 详情请求：失败返回 null；**CancellationException 必须原样抛出**，不能吞掉。
+                            val detail = try {
+                                (container.repository.comicDetail(comic.id) as? com.jmreader.data.repository.Resource.Success)?.data
+                            } catch (ce: kotlinx.coroutines.CancellationException) {
+                                throw ce
+                            } catch (_: Throwable) {
+                                null
+                            }
+                            if (detail == null) return@withPermit
+                            val enriched = comic.copy(
+                                name = detail.name.takeIf { it.isNotBlank() } ?: comic.name,
+                                author = detail.author?.takeIf { it.isNotBlank() } ?: comic.author,
+                                tags = detail.tags.ifEmpty { comic.tags },
+                                cover = detail.cover?.takeIf { it.isNotBlank() } ?: comic.cover,
+                                likes = detail.likes?.takeIf { it.isNotBlank() } ?: comic.likes,
+                                views = detail.views?.takeIf { it.isNotBlank() } ?: comic.views,
+                                publishTime = detail.publishTime?.takeIf { it.isNotBlank() } ?: comic.publishTime,
+                            )
+                            // 屏蔽过滤即时可见（不必等落盘）。
+                            if (enriched.tags.isNotEmpty()) enrichedLocalTags[comic.id] = enriched.tags
+                            // 落盘：三个 Store 均按 id 原地更新（持各自 mutex），保留已有值/分组/顺序，不复活已删除项。
+                            try {
+                                container.favoritesStore.updateMetadata(enriched)
+                                container.historyStore.updateMetadata(enriched)
+                                container.browseHistoryStore.updateMetadata(enriched)
+                            } catch (ce: kotlinx.coroutines.CancellationException) {
+                                throw ce
+                            } catch (_: Throwable) {
+                            }
+                            succeeded.incrementAndGet()
                         }
                     }
-                    else -> {}
                 }
-            } catch (_: Throwable) {}
+            }
+            enrichVersion++
+            // 本轮无任何成功（如整批请求失败）则停止，避免无谓地继续扫。
+            if (succeeded.get() == 0) break
         }
     }
     // v27.5 #15：本地收藏分组过滤。filterFolder=null 表示「全部」；"__none__" 表示「未分组」
@@ -553,3 +615,12 @@ private fun ServerFavoritesTab(
         }
     }
 }
+
+/**
+ * v27.16：收藏 / 浏览历史 / 阅读历史「元数据补全」的单轮批大小。
+ * 控制"每轮适量"——一次最多发这么多详情请求，处理完再取下一批，避免一进页面就打满网络。
+ */
+private const val ENRICH_BATCH_SIZE = 20
+
+/** v27.16：补全并发度（信号量限流）。4 并发兼顾补全速度与对 API 的压力。 */
+private const val ENRICH_CONCURRENCY = 4

@@ -282,7 +282,7 @@ private fun ForumListContent(
         state = listState,
         modifier = modifier,
         contentPadding = PaddingValues(12.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+        verticalArrangement = Arrangement.spacedBy(0.dp),
     ) {
         itemsIndexed(comments, key = { i, c -> "$i:${c.cid}" }) { _, c ->
             val aid = forumComicId(c)
@@ -396,128 +396,11 @@ private fun ForumCommentCard(
     onRetryPreview: () -> Unit,
     onOpenComic: (String) -> Unit,
 ) {
-
-    val ctx = LocalContext.current
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .combinedClickable(
-                onClick = {},
-                onLongClick = {
-                    val cm = ctx.getSystemService(android.content.ClipboardManager::class.java)
-                    cm?.setPrimaryClip(
-                        android.content.ClipData.newPlainText("comment", comment.content),
-                    )
-                    android.widget.Toast.makeText(ctx, "已复制评论内容", android.widget.Toast.LENGTH_SHORT).show()
-                },
-            ),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        elevation = CardDefaults.cardElevation(defaultElevation = com.jmreader.ui.theme.LocalCardElevation.current),
-        shape = RoundedCornerShape(14.dp),
-    ) {
-        Row(Modifier.padding(14.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        Column(Modifier.weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                com.jmreader.ui.components.UserAvatar(
-                    avatar = comment.photo,
-                    name = comment.nickname,
-                    sizeDp = 32,
-                )
-                Spacer(Modifier.width(10.dp))
-                Column(modifier = Modifier.weight(1f)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            comment.nickname.ifBlank { "匿名" },
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            color = MaterialTheme.colorScheme.primary,
-                            maxLines = 1,
-                            modifier = Modifier.weight(1f, fill = false),
-                        )
-                        if (comment.level > 0) {
-                            Spacer(Modifier.width(6.dp))
-                            Text(
-                                "Lv.${comment.level}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.secondary,
-                                modifier = Modifier
-                                    .background(
-                                        MaterialTheme.colorScheme.secondaryContainer,
-                                        RoundedCornerShape(4.dp),
-                                    )
-                                    .padding(horizontal = 4.dp, vertical = 1.dp),
-                            )
-                        }
-                    }
-                    val metaText = buildString {
-                        if (comment.likes > 0) append("♥ ${comment.likes}")
-                        if (comment.addtime.isNotBlank()) {
-                            if (isNotEmpty()) append(" · ")
-                            append(comment.addtime)
-                        }
-                    }
-                    if (metaText.isNotBlank()) {
-                        Text(
-                            metaText,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                }
-            }
-            if (comment.content.isNotBlank()) {
-                Spacer(Modifier.height(10.dp))
-                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
-                Spacer(Modifier.height(10.dp))
-                JmLinkedText(
-                    text = comment.content,
-                    onOpenComic = onOpenComic,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
-            // 本子标题：可点跳转该本子详情页（jasmine 同款行为）
-            if (!comment.aid.isNullOrBlank() && comment.name.isNotBlank()) {
-                Spacer(Modifier.height(8.dp))
-                val aid = comment.aid
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f))
-                        .clickable { onOpenComic(aid) }
-                        .padding(horizontal = 10.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Icon(
-                        Icons.Outlined.OpenInNew,
-                        contentDescription = null,
-                        modifier = Modifier.size(14.dp),
-                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                    )
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        comment.name,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f),
-                    )
-                }
-            }
-            // 嵌套回复：内联展示（缩进 + 浅色背景）
-            if (comment.replys.isNotEmpty()) {
-                Spacer(Modifier.height(8.dp))
-                comment.replys.forEach { reply ->
-                    ReplyItem(reply = reply, onOpenComic = onOpenComic)
-                    Spacer(Modifier.height(6.dp))
-                }
-            }
-        }
-        if (comicId != null) {
-            ForumComicPreview(
+    com.jmreader.ui.components.CompactComment(
+        comment = comment,
+        onOpenComic = onOpenComic,
+        attachment = if (comicId == null) null else ({
+            com.jmreader.ui.components.CompactCommentAttachment(
                 comicId = comicId,
                 title = preview?.name?.takeIf { it.isNotBlank() } ?: comment.name,
                 preview = preview,
@@ -525,104 +408,20 @@ private fun ForumCommentCard(
                 onRetry = onRetryPreview,
                 onOpen = { onOpenComic(comicId) },
             )
-        }
-        }
-    }
-}
-
-@Composable
-private fun ForumComicPreview(
-    comicId: String,
-    title: String,
-    preview: ComicDetailDto?,
-    error: String?,
-    onRetry: () -> Unit,
-    onOpen: () -> Unit,
-) {
-    Column(
-        modifier = Modifier.width(96.dp).clip(RoundedCornerShape(8.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant).clickable(onClick = onOpen).padding(6.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp),
-    ) {
-        if (!preview?.cover.isNullOrBlank()) {
-            AsyncImage(
-                model = preview?.cover,
-                contentDescription = title,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxWidth().height(116.dp).clip(RoundedCornerShape(6.dp)),
-            )
-        } else if (preview == null && error == null) {
-            Box(Modifier.fillMaxWidth().height(116.dp), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-            }
-        }
-        if (title.isNotBlank()) Text(title, style = MaterialTheme.typography.labelSmall, maxLines = 3, overflow = TextOverflow.Ellipsis)
-        Text("JM$comicId", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
-        preview?.tags?.takeIf { it.isNotEmpty() }?.let { tags ->
-            Text(tags.joinToString(" · "), style = MaterialTheme.typography.labelSmall, maxLines = 4, overflow = TextOverflow.Ellipsis)
-        }
-        if (error != null) {
-            Text("预览加载失败", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
-            TextButton(onClick = onRetry, contentPadding = PaddingValues(0.dp)) { Text("重试预览") }
-        }
-    }
-}
-
-/** 嵌套回复项：缩进 + 浅色背景，与主评论区分。 */
-@Composable
-private fun ReplyItem(reply: JmCommentDto, onOpenComic: (String) -> Unit) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-            .padding(10.dp),
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            com.jmreader.ui.components.UserAvatar(
-                avatar = reply.photo,
-                name = reply.nickname,
-                sizeDp = 24,
-            )
-            Spacer(Modifier.width(8.dp))
-            Text(
-                reply.nickname.ifBlank { "匿名" },
-                style = MaterialTheme.typography.labelSmall,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.primary,
-                maxLines = 1,
-                modifier = Modifier.weight(1f, fill = false),
-            )
-            if (reply.addtime.isNotBlank()) {
-                Text(
-                    reply.addtime,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-        }
-        if (reply.content.isNotBlank()) {
-            Spacer(Modifier.height(6.dp))
-            JmLinkedText(
-                text = reply.content,
-                onOpenComic = onOpenComic,
-                modifier = Modifier.fillMaxWidth(),
-            )
-        }
-    }
+        }),
+    )
 }
 
 // ============================ JM 编号可点链接 ============================
 
 internal fun linkifyJm(text: String, linkColor: androidx.compose.ui.graphics.Color): AnnotatedString {
-    val jmRegex = Regex("""\b(JM|jm)(\d{4,8})\b""")
+    val jmRegex = Regex("(?i)(?<![a-z0-9_])JM([0-9]{1,18})(?![a-z0-9_])")
     return buildAnnotatedString {
         var lastEnd = 0
         for (m in jmRegex.findAll(text)) {
+            val id = m.groupValues[1]
+            if (id.all { it == '0' }) continue
             append(text.substring(lastEnd, m.range.first))
-            val id = m.groupValues[2]
             pushStringAnnotation(tag = "JM_LINK", annotation = id)
             withStyle(SpanStyle(color = linkColor, fontWeight = FontWeight.SemiBold)) {
                 append(m.value)
@@ -639,6 +438,8 @@ internal fun JmLinkedText(
     text: String,
     onOpenComic: (String) -> Unit,
     modifier: Modifier = Modifier,
+    maxLines: Int = Int.MAX_VALUE,
+    onTextLayout: (androidx.compose.ui.text.TextLayoutResult) -> Unit = {},
 ) {
     val linkColor = MaterialTheme.colorScheme.primary
     val annotated = remember(text, linkColor) {
@@ -646,6 +447,9 @@ internal fun JmLinkedText(
     }
     androidx.compose.foundation.text.ClickableText(
         text = annotated,
+        maxLines = maxLines,
+        overflow = TextOverflow.Ellipsis,
+        onTextLayout = onTextLayout,
         style = MaterialTheme.typography.bodyMedium.copy(
             lineHeight = androidx.compose.ui.unit.TextUnit(22f, androidx.compose.ui.unit.TextUnitType.Sp),
             color = MaterialTheme.colorScheme.onSurface,

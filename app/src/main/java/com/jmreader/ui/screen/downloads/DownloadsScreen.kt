@@ -55,6 +55,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavController
+import com.jmreader.core.Logger
 import com.jmreader.data.AppContainer
 import com.jmreader.data.download.DownloadStatus
 import com.jmreader.data.download.DownloadTask
@@ -84,15 +85,30 @@ fun DownloadsScreen(container: AppContainer, navController: NavController) {
     val saFLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree(),
     ) { uri: Uri? ->
-        if (uri != null) {
-            // 持久化 URI 读写权限，避免重启后失去访问
-            runCatching {
-                val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                ctx.contentResolver.takePersistableUriPermission(uri, flags)
-            }
-            scope.launch {
+        if (uri == null) return@rememberLauncherForActivityResult
+        // v27.16：必须先成功取得持久化 URI 权限，否则重启后会失去对该目录的访问。
+        // 旧实现用 runCatching 吞掉失败后仍然保存 URI 并提示成功——权限没拿到也报成功，
+        // 后续自动复制会失败。现在失败则明确报错，且不写入设置（保留旧路径）。
+        val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        val granted = runCatching {
+            ctx.contentResolver.takePersistableUriPermission(uri, flags)
+            ctx.contentResolver.persistedUriPermissions.any { it.uri == uri && it.isReadPermission && it.isWritePermission }
+        }.getOrDefault(false)
+        if (!granted) {
+            Logger.w("Downloads", "takePersistableUriPermission 失败，未保存下载路径")
+            scope.launch { snackbar.showSnackbar("无法获得该目录的持久访问权限，未保存下载路径") }
+            return@rememberLauncherForActivityResult
+        }
+        scope.launch {
+            // v27.16：写配置也要兜底。失败时保留旧值并明确报错，不谎报成功。
+            try {
                 container.settingsStore.setDownloadDirUri(uri.toString())
                 snackbar.showSnackbar("已设置下载路径，下载完成后将自动复制到外部存储")
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                Logger.w("Downloads", "保存下载路径失败: ${Logger.brief(e)}")
+                snackbar.showSnackbar("保存下载路径失败，已保留原路径")
             }
         }
     }
@@ -326,6 +342,13 @@ private fun DownloadItem(
                     DownloadStatus.COMPLETED -> "已完成 ${task.totalChapters} 章"
                     DownloadStatus.FAILED -> buildString {
                         append("下载失败")
+                        // v27.16：展示失败原因的首个非空行（截断），既不隐藏原因也不泄露整段技术栈。
+                        val reason = task.waitingReason
+                            ?.lineSequence()
+                            ?.map { it.trim() }
+                            ?.firstOrNull { it.isNotEmpty() }
+                            ?.take(60)
+                        if (!reason.isNullOrEmpty()) append("：$reason")
                         if (task.failedImages > 0) append("（${task.failedImages} 张图失败）")
                     }
                 }

@@ -89,6 +89,44 @@ private val ORDERS = listOf(
 private const val SEARCH_BATCH_SIZE = 80
 private const val SEARCH_MAX_SOURCE_PAGES = 16
 
+/** JM 本子号 token：可选的（大小写不敏感）JM 前缀 + 1~18 位数字。group(2) = 纯数字。 */
+private val JM_ID_TOKEN = Regex("^(jm)?([0-9]{1,18})$", RegexOption.IGNORE_CASE)
+
+/**
+ * v27.16：解析输入是否为批量 JM 号搜索（纯函数，便于单元测试）。
+ *
+ * 规则（比旧版更严格，避免把英文短语/普通关键词误判成本子号）：
+ * - 用空白/中英文逗号/句号/分号拆分；拆分后 token 数必须 ≥ 2，否则返回 null（单个号走普通搜索）。
+ * - 每个 token 必须是「1~18 位非全零纯数字」或「大小写不敏感的 JM 前缀 + 1~18 位非全零数字」。
+ *   旧版只校验 `[A-Za-z0-9]+` 且长度 ≤ 30，导致 "naruto bleach" 这类英文短语被当成两个 JM 号。
+ * - 统一归一化为纯数字（去掉 JM 前缀）后按输入顺序去重（"JM123" 与 "123" 视为同一个）。
+ * - 只要有一个 token 不合法，就返回 null（按普通关键词走 search API）。
+ *
+ * @return 归一化去重后的纯数字 ID 列表；null 表示不是批量搜索。
+ */
+internal fun parseBatchIdsInput(input: String): List<String>? {
+    val tokens = input.split(Regex("[\\s,，。;；]+"))
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
+    if (tokens.size < 2) return null
+    val seen = HashSet<String>(tokens.size)
+    val ordered = ArrayList<String>(tokens.size)
+    for (t in tokens) {
+        val id = normalizeJmIdToken(t) ?: return null
+        if (seen.add(id)) ordered.add(id)
+    }
+    return ordered
+}
+
+/** 单个 token 归一化：合法 JM 号返回纯数字串，否则返回 null。 */
+private fun normalizeJmIdToken(token: String): String? {
+    val m = JM_ID_TOKEN.matchEntire(token) ?: return null
+    val digits = m.groupValues[2]
+    // 全零（如 "0"、"000"）不是有效本子号
+    if (digits.all { it == '0' }) return null
+    return digits
+}
+
 class SearchViewModel(container: AppContainer) : BaseListViewModel(container) {
     var query by mutableStateOf("")
         private set
@@ -224,28 +262,10 @@ class SearchViewModel(container: AppContainer) : BaseListViewModel(container) {
     }
 
     /**
-     * v27.14：解析输入是否为批量 JM 号搜索。
-     *
-     * 触发条件：输入含分隔符（空格/逗号/句号/分号，中英文皆可），且拆分后≥2 个 token，
-     * 且每个 token 均为纯字母数字（JM ID 特征），长度 1..30。
-     *
-     * @return 按输入顺序去重后的 ID 列表，或 null 表示不是批量搜索（按普通关键词走 search API）。
+     * v27.16：解析输入是否为批量 JM 号搜索。
+     * 解析规则已抽到文件顶层纯函数 [parseBatchIdsInput]，便于单元测试。
      */
-    fun parseBatchIds(input: String): List<String>? {
-        val tokens = input.split(Regex("[\\s,，。;；]+"))
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-        if (tokens.size < 2) return null
-        val idPattern = Regex("^[A-Za-z0-9]+$")
-        if (!tokens.all { idPattern.matches(it) && it.length <= 30 }) return null
-        // 按输入顺序去重（用户可能重复输入同一个 ID）
-        val seen = HashSet<String>(tokens.size)
-        val ordered = ArrayList<String>(tokens.size)
-        for (t in tokens) {
-            if (seen.add(t)) ordered.add(t)
-        }
-        return ordered
-    }
+    fun parseBatchIds(input: String): List<String>? = parseBatchIdsInput(input)
 
     /**
      * v27.14：批量按 JM 号搜索。
@@ -446,9 +466,9 @@ fun SearchScreen(
     }
     val onImageSearch = remember(navController) { { navController.navigate(Routes.IMAGE_SEARCH) } }
     val onViewLogs = remember(navController) { { navController.navigate(Routes.LOGS) } }
-    val onClearHistory = remember(scope, container) {
-        { scope.launch { container.searchHistoryStore.clear() }; Unit }
-    }
+    // v27.16：清空搜索历史不可恢复，先弹确认对话框。
+    var showClearHistoryConfirm by remember { mutableStateOf(false) }
+    val onClearHistory = remember { { showClearHistoryConfirm = true; Unit } }
     // v27.14：用 retrySearch 而非 refresh，批量搜索失败时也能正确重试（refresh 在 batchMode 下返回空）
     val onRetry = remember(vm) { { vm.retrySearch() } }
     val onLoadMore = remember(vm) { { vm.loadMore() } }
@@ -545,27 +565,20 @@ fun SearchScreen(
         }
     }
 
-    // Bug 8 修复：搜索结果加载完成后自动收起键盘。
-    // 之前 debounce 自动搜索（输入停顿 400ms）不收键盘，键盘遮挡底部导航栏，
-    // 用户点首页 tab 实际点到键盘上 →「无法跳转首页」。
-    //
-    // 关键修复（v26）：原条件 `!state.refreshing && state.items.isNotEmpty()` 只在
-    // "搜索完成且有结果"时收键盘。若搜索无结果/出错，键盘不收，底部 tab 仍被遮挡。
-    // 改为只要 refreshing 从 true 变 false 就收键盘（搜索完成即收，无论结果如何）。
-    LaunchedEffect(state.refreshing) {
-        if (!state.refreshing) {
-            keyboardController?.hide()
-        }
-    }
+    // v27.16：不再在搜索完成（refreshing 变 false）时自动收键盘。
+    // 原 v26 逻辑会在每次搜索返回后强制 hide()，用户在输入框反复修改关键词时键盘被反复
+    // 收起、输入被打断。改为仅在用户明确操作时收键盘：
+    //   - IME「搜索」键（见下方 keyboardActions.onSearch）
+    //   - 明确滚动结果列表（见下方 snapshotFlow）
     // 滚动列表时也收键盘：用户开始浏览结果时键盘应消失，露出底部导航栏。
-    // 用 snapshotFlow 监听 firstVisibleItemIndex 变化，任何滚动即 hide。
+    // 只在滚动进行时收键盘，避免恢复到非零位置后重新聚焦输入又被立即收起。
     LaunchedEffect(listState) {
-        androidx.compose.runtime.snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
-            .collect { (idx, off) -> if (idx != 0 || off != 0) keyboardController?.hide() }
+        androidx.compose.runtime.snapshotFlow { listState.isScrollInProgress }
+            .collect { scrolling -> if (scrolling) keyboardController?.hide() }
     }
     LaunchedEffect(gridState) {
-        androidx.compose.runtime.snapshotFlow { gridState.firstVisibleItemIndex to gridState.firstVisibleItemScrollOffset }
-            .collect { (idx, off) -> if (idx != 0 || off != 0) keyboardController?.hide() }
+        androidx.compose.runtime.snapshotFlow { gridState.isScrollInProgress }
+            .collect { scrolling -> if (scrolling) keyboardController?.hide() }
     }
 
     // Bug 11 修复：把 lastScrolledQuery/Order 提到 when 分支外，
@@ -815,6 +828,22 @@ fun SearchScreen(
          snackbar,
          modifier = Modifier.align(androidx.compose.ui.Alignment.BottomCenter),
      )
+     if (showClearHistoryConfirm) {
+         androidx.compose.material3.AlertDialog(
+             onDismissRequest = { showClearHistoryConfirm = false },
+             title = { Text("清空搜索历史") },
+             text = { Text("将清空全部搜索历史记录，此操作不可恢复。") },
+             confirmButton = {
+                 androidx.compose.material3.TextButton(onClick = {
+                     showClearHistoryConfirm = false
+                     scope.launch { container.searchHistoryStore.clear() }
+                 }) { Text("清空", color = MaterialTheme.colorScheme.error) }
+             },
+             dismissButton = {
+                 androidx.compose.material3.TextButton(onClick = { showClearHistoryConfirm = false }) { Text("取消") }
+             },
+         )
+     }
     } // end Box
 }
 

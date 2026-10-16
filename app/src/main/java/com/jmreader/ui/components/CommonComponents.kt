@@ -32,6 +32,7 @@ import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Block
@@ -406,6 +407,57 @@ private fun ListFooter(
 }
 
 /**
+ * v27.16 新增：所有卡片样式共用的「JM 编号 + 真实发布日期」行。
+ *
+ * - **JM 编号**用 [SelectionContainer] 包裹（仅编号本身可选中），用户长按即可复制编号；
+ *   日期与其它文字不参与选择，避免长按整卡时误选一堆内容。
+ * - **发布日期**直接展示已解析出的真实值；[publishTime] 为空时**不显示、不造值**。
+ * - 编号与日期都为空时整行不渲染，保持卡片紧凑（旧数据也不会凭空多出一行）。
+ *
+ * @param fontSize 跟随各卡片的正文/统计字号设置（用户可在设置页调节）。
+ * @param color 跟随各卡片对应文字色（深色模式自动适配）。
+ */
+@Composable
+private fun JmIdAndDateLine(
+    id: String,
+    publishTime: String?,
+    fontSize: androidx.compose.ui.unit.TextUnit,
+    color: Color,
+    modifier: Modifier = Modifier,
+) {
+    val date = publishTime?.takeIf { it.isNotBlank() }
+    val hasId = id.isNotBlank()
+    if (!hasId && date == null) return
+    Row(
+        modifier = modifier,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (hasId) {
+            // 仅包裹编号：可长按选中复制，不影响卡片点击/长按菜单（长按编号才进入选择）。
+            SelectionContainer {
+                Text(
+                    text = "JM$id",
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = fontSize),
+                    color = color,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        if (date != null) {
+            Text(
+                text = if (hasId) "  ·  $date" else date,
+                style = MaterialTheme.typography.labelSmall.copy(fontSize = fontSize),
+                color = color,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+        }
+    }
+}
+
+/**
  * 单个本子卡片：横向布局。
  *
  * ```
@@ -538,15 +590,20 @@ fun ComicCard(
                 val displayTags = remember(item.tags) { item.tags.take(4) }
                 TagChipsRow(tags = displayTags, modifier = Modifier.padding(top = 2.dp))
             }
-            // 观看数 / 喜欢数 / 发布时间（v26 新增：列表卡片旁显示发布日期，方便判断本子新旧）
-            // v27.6：过滤 "0"（API 返回的占位值），避免误导用户
+            // v27.16：JM 编号（可复制）+ 真实发布日期单独一行；无日期不显示、不造值。
+            JmIdAndDateLine(
+                id = item.id,
+                publishTime = item.publishTime,
+                fontSize = bodyFontSize.sp,
+                color = statsColor,
+                modifier = Modifier.padding(top = 2.dp),
+            )
+            // 观看数 / 喜欢数（v27.6：过滤 "0"（API 返回的占位值），避免误导用户）
             // v27.12：remember 缓存拼接结果，避免 buildList 每次重组分配
             val views = item.views?.takeIf { it.isNotBlank() && it != "0" }
             val likes = item.likes?.takeIf { it.isNotBlank() && it != "0" }
-            val publishTime = item.publishTime
-            val statsText = remember(views, likes, publishTime) {
+            val statsText = remember(views, likes) {
                 buildList {
-                    publishTime?.takeIf { it.isNotBlank() }?.let { add(it) }
                     views?.takeIf { it.isNotBlank() }?.let { add("观看 $it") }
                     likes?.takeIf { it.isNotBlank() }?.let { add("喜欢 $it") }
                 }.joinToString(" · ")
@@ -650,17 +707,14 @@ fun ComicGridCard(
             fontWeight = FontWeight.SemiBold,
             color = MaterialTheme.colorScheme.onSurface,
         )
-        // 发布时间（v26 新增：网格卡片也显示发布日期，方便判断新旧）
-        item.publishTime?.takeIf { it.isNotBlank() }?.let { pt ->
-            Text(
-                text = pt,
-                style = MaterialTheme.typography.labelSmall.copy(fontSize = bodyFontSize.sp),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.padding(top = 2.dp),
-            )
-        }
+        // v27.16：JM 编号（可复制）+ 真实发布日期（无日期不显示、不造值）
+        JmIdAndDateLine(
+            id = item.id,
+            publishTime = item.publishTime,
+            fontSize = bodyFontSize.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 2.dp),
+        )
     }
 }
 
@@ -766,16 +820,21 @@ fun ComicCardStyle(
                 modifier = Modifier.padding(top = 6.dp),
             )
         }
-        // 作者 + 统计 + 发布时间（v26 新增：列表卡片旁显示发布日期）
-        // v27.6：过滤 "0"（API 占位值），避免误导
+        // v27.16：JM 编号（可复制）+ 真实发布日期（无日期不显示、不造值）
+        JmIdAndDateLine(
+            id = item.id,
+            publishTime = item.publishTime,
+            fontSize = bodyFontSize.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 4.dp),
+        )
+        // 作者 + 统计（v27.6：过滤 "0"（API 占位值），避免误导）
         val author = item.author
         val views = item.views?.takeIf { it.isNotBlank() && it != "0" }
         val likes = item.likes?.takeIf { it.isNotBlank() && it != "0" }
-        val publishTime = item.publishTime
-        val metaText = remember(author, views, likes, publishTime) {
+        val metaText = remember(author, views, likes) {
             buildList {
                 author?.takeIf { it.isNotBlank() }?.let { add(it) }
-                publishTime?.takeIf { it.isNotBlank() }?.let { add(it) }
                 views?.takeIf { it.isNotBlank() }?.let { add("观看 $it") }
                 likes?.takeIf { it.isNotBlank() }?.let { add("喜欢 $it") }
             }.joinToString(" · ")
@@ -889,14 +948,18 @@ fun ComicMagazineCard(
                 small = true,
             )
         }
-        // 作者 + 发布时间（v26 新增：杂志风卡片也显示发布日期）
+        // v27.16：JM 编号（可复制）+ 真实发布日期（无日期不显示、不造值）
+        JmIdAndDateLine(
+            id = item.id,
+            publishTime = item.publishTime,
+            fontSize = bodyFontSize.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 2.dp),
+        )
+        // 作者
         val author = item.author
-        val publishTime = item.publishTime
-        val magText = remember(author, publishTime) {
-            buildList {
-                author?.takeIf { it.isNotBlank() }?.let { add(it) }
-                publishTime?.takeIf { it.isNotBlank() }?.let { add(it) }
-            }.joinToString(" · ")
+        val magText = remember(author) {
+            author?.takeIf { it.isNotBlank() } ?: ""
         }
         if (magText.isNotEmpty()) {
             Text(

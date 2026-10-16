@@ -288,6 +288,48 @@ class FavoritesStore(context: Context, moshi: Moshi, scope: CoroutineScope) {
         }
     }
 
+    /**
+     * v27.16：用详情接口补全后的元数据，按 id **原地**更新本地收藏条目。
+     *
+     * 需求约束（逐条对应）：
+     * - **持久化时用互斥锁**：整个 read-modify-write 在 [mutex] 内，与 load/toggle/remove/... 串行，
+     *   不会读到写一半的文件，也不会覆盖并发的写操作。
+     * - **按 id 更新当前条目**：只替换 `comic` 字段，`folderId` 原样保留 → 不覆盖分组。
+     * - **不复活已删除收藏**：id 在列表中不存在时直接跳过（绝不新增），因此正在补全的条目
+     *   若已被用户 `remove`，补全结果会被安全丢弃。
+     * - **不修改收藏顺序**：`map` 原地替换，不移动位置、不插到头部。
+     * - **merge 保留已有值**：用 [mergeComicMetadata] 合并，本地已有非空值不被空值覆盖。
+     * - 无实际变化时不落盘、不发射 StateFlow（避免无谓重组与重复补全）。
+     *
+     * @return 是否真的写入了新信息（true=有条目被更新）。
+     */
+    suspend fun updateMetadata(comic: ComicBriefDto): Boolean = withContext(Dispatchers.IO) {
+        ensureLoaded()
+        if (comic.id.isBlank()) return@withContext false
+        mutex.withLock {
+            val old = _entries.value
+            var changed = false
+            val next = old.map { e ->
+                if (e.comic.id == comic.id) {
+                    val merged = mergeComicMetadata(e.comic, comic)
+                    if (merged != e.comic) {
+                        changed = true
+                        e.copy(comic = merged)
+                    } else {
+                        e
+                    }
+                } else {
+                    e
+                }
+            }
+            if (changed) {
+                persist(_folders.value, next)
+                _entries.value = next
+            }
+            changed
+        }
+    }
+
     suspend fun clear() = withContext(Dispatchers.IO) {
         ensureLoaded()
         mutex.withLock {

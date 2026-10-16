@@ -239,11 +239,15 @@ fun HomeScreen(container: AppContainer, navController: NavController) {
     // 用 Box 包裹以承载 SnackbarHost：长按屏蔽/收藏操作需要反馈
     Box(Modifier.fillMaxSize()) {
      Column(Modifier.fillMaxSize()) {
-        TextButton(onClick = { showRandomReading = true }, modifier = Modifier.fillMaxWidth()) { Text("从收藏 / 历史随机阅读") }
         PrimaryTabRow(selectedTabIndex = tab) {
             Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text(stringResource(R.string.home_latest)) })
             Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text(stringResource(R.string.home_ranking)) })
             Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("随机") })
+        }
+        if (tab == 2) {
+            TextButton(onClick = { showRandomReading = true }, modifier = Modifier.fillMaxWidth()) {
+                Text("从本地收藏 / 阅读历史抽取")
+            }
         }
         TemplateRecommendationRow(
             items = recommendationState.items,

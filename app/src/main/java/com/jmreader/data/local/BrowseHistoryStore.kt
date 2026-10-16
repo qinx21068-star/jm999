@@ -92,6 +92,38 @@ class BrowseHistoryStore(context: Context, moshi: Moshi, scope: CoroutineScope) 
         }
     }
 
+    /**
+     * v27.16：用补全后的元数据按 comicId **原地**更新浏览历史里的漫画信息。
+     *
+     * 与 [FavoritesStore.updateMetadata] 同语义：持 [mutex]、按 id 原地替换、保留
+     * [BrowseEntry.updatedAt] 与列表顺序；id 不存在则忽略（不新增）；merge 保留已有值。
+     */
+    suspend fun updateMetadata(comic: ComicBriefDto) = withContext(Dispatchers.IO) {
+        ensureLoaded()
+        if (comic.id.isBlank()) return@withContext
+        mutex.withLock {
+            val old = _items.value
+            var changed = false
+            val next = old.map { e ->
+                if (e.comic.id == comic.id) {
+                    val merged = mergeComicMetadata(e.comic, comic)
+                    if (merged != e.comic) {
+                        changed = true
+                        e.copy(comic = merged)
+                    } else {
+                        e
+                    }
+                } else {
+                    e
+                }
+            }
+            if (changed) {
+                persist(next)
+                _items.value = next
+            }
+        }
+    }
+
     suspend fun importData(records: List<BrowseEntry>, merge: Boolean) = withContext(Dispatchers.IO) {
         ensureLoaded()
         mutex.withLock {

@@ -290,12 +290,17 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
         _events.emit(if (v) "已开启通知栏稍后再看" else "已关闭通知栏稍后再看")
     }
 
-    /** 清缓存：图片/搜索/全部。 */
+    /**
+     * 清缓存：图片/搜索/全部。
+     *
+     * v27.16：图片缓存是异步清理（[com.jmreader.data.AppContainer.clearImageCache] 内部在
+     * appScope 上 fire-and-forget），所以反馈用「已开始清理」而非「已清除」，避免谎报完成。
+     */
     fun clearCache(target: com.jmreader.data.local.ClearCacheTarget) = launchSafe {
         val msg = when (target) {
             com.jmreader.data.local.ClearCacheTarget.IMAGES -> {
                 container.clearImageCache()
-                "已清除图片缓存"
+                "已开始清理图片缓存"
             }
             com.jmreader.data.local.ClearCacheTarget.SEARCH -> {
                 container.searchHistoryStore.clear()
@@ -304,7 +309,7 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
             com.jmreader.data.local.ClearCacheTarget.ALL -> {
                 container.clearImageCache()
                 container.searchHistoryStore.clear()
-                "已清除全部缓存"
+                "已开始清理图片缓存，并已清除搜索历史"
             }
         }
         _events.emit(msg)
@@ -1040,9 +1045,9 @@ private fun AppearanceSettingsScreen(
                 }
             }
             HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
-            Text("顶部 Tab 栏样式", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Medium)
+            Text("底部导航栏标签", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Medium)
             Text(
-                "DEFAULT=图标+文字；COMPACT=紧凑图标+文字；ICON_ONLY=仅图标（节省横向空间）。",
+                "默认显示图标和文字；紧凑、仅图标均隐藏文字标签，节省横向空间。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 2.dp),
@@ -1561,6 +1566,8 @@ private fun NetworkSettingsScreen(
     inner: PaddingValues,
     scrollState: androidx.compose.foundation.ScrollState,
 ) {
+    // v27.16：清搜索历史 / 全部清除不可恢复，先弹确认对话框（清图片缓存是异步且可重建，无需确认）。
+    var clearConfirmTarget by remember { mutableStateOf<com.jmreader.data.local.ClearCacheTarget?>(null) }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -1773,7 +1780,7 @@ private fun NetworkSettingsScreen(
             Text("下载路径", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Medium)
             Text(
                 "当前：${settings?.downloadDirUri?.let { "自定义外部路径（下载后自动复制）" } ?: "App 内部存储（默认）"}\n" +
-                    "在「下载」页面长按任务或菜单中可设置外部存储路径，下载完成后自动复制到该目录。",
+                    "在「下载」页面点右上角的文件夹图标即可选择外部存储目录，下载完成后自动复制到该目录。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 2.dp),
@@ -1792,7 +1799,7 @@ private fun NetworkSettingsScreen(
             icon = Icons.Outlined.Cloud,
         ) {
             Text(
-                "清除图片缓存可释放磁盘空间但下次浏览需重新下载。清除搜索历史不可恢复。",
+                "清除图片缓存可释放磁盘空间但下次浏览需重新下载。清除搜索历史不可恢复。「全部清除」仅包含图片缓存与搜索历史，不会删除已下载的本子或阅读进度。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -1807,14 +1814,37 @@ private fun NetworkSettingsScreen(
                     modifier = Modifier.weight(1f),
                 ) { Text("清图片缓存", maxLines = 1) }
                 OutlinedButton(
-                    onClick = { vm.clearCache(com.jmreader.data.local.ClearCacheTarget.SEARCH) },
+                    onClick = { clearConfirmTarget = com.jmreader.data.local.ClearCacheTarget.SEARCH },
                     modifier = Modifier.weight(1f),
                 ) { Text("清搜索历史", maxLines = 1) }
                 OutlinedButton(
-                    onClick = { vm.clearCache(com.jmreader.data.local.ClearCacheTarget.ALL) },
+                    onClick = { clearConfirmTarget = com.jmreader.data.local.ClearCacheTarget.ALL },
                     modifier = Modifier.weight(1f),
                 ) { Text("全部清除", maxLines = 1) }
             }
+        }
+        clearConfirmTarget?.let { target ->
+            val isSearch = target == com.jmreader.data.local.ClearCacheTarget.SEARCH
+            AlertDialog(
+                onDismissRequest = { clearConfirmTarget = null },
+                title = { Text(if (isSearch) "清除搜索历史" else "全部清除") },
+                text = {
+                    Text(
+                        if (isSearch) "将清空全部搜索历史记录，此操作不可恢复。"
+                        else "将清理图片缓存并清空搜索历史（仅这两项，不影响已下载内容和阅读进度）。清除搜索历史不可恢复。",
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        val t = target
+                        clearConfirmTarget = null
+                        vm.clearCache(t)
+                    }) { Text("清除", color = MaterialTheme.colorScheme.error) }
+                },
+                dismissButton = {
+                    TextButton(onClick = { clearConfirmTarget = null }) { Text("取消") }
+                },
+            )
         }
         Spacer(Modifier.height(24.dp))
     }

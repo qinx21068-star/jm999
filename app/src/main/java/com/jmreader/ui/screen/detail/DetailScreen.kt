@@ -1163,54 +1163,8 @@ private fun InlineCommentsSection(
     }
 }
 
-/** 内嵌评论的单条卡片：简化版 CommentCard，无楼层跳页/复制等长按功能（详情页内嵌只读浏览）。 */
+/** Work comments share the compact layout, without redundant work attachments. */
 @Composable
-private fun InlineCommentItem(
-    comment: JmCommentDto,
-    onOpenComic: (String) -> Unit,
-) {
-    Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            com.jmreader.ui.components.UserAvatar(
-                avatar = comment.photo,
-                name = comment.nickname,
-                sizeDp = 28,
-            )
-            Spacer(Modifier.width(8.dp))
-            Column(Modifier.weight(1f)) {
-                Text(
-                    comment.nickname.ifBlank { "匿名" },
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.primary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                val meta = buildString {
-                    if (comment.likes > 0) append("♥ ${comment.likes}")
-                    if (comment.addtime.isNotBlank()) {
-                        if (isNotEmpty()) append(" · ")
-                        append(comment.addtime)
-                    }
-                }
-                if (meta.isNotBlank()) {
-                    Text(
-                        meta,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-            }
-        }
-        if (comment.content.isNotBlank()) {
-            Spacer(Modifier.height(6.dp))
-            com.jmreader.ui.screen.forum.JmLinkedText(
-                text = comment.content,
-                onOpenComic = onOpenComic,
-                modifier = Modifier.fillMaxWidth(),
-            )
-        }
-    }
+private fun InlineCommentItem(comment: JmCommentDto, onOpenComic: (String) -> Unit) {
+    com.jmreader.ui.components.CompactComment(comment = comment, onOpenComic = onOpenComic)
 }
