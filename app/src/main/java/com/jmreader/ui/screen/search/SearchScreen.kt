@@ -391,14 +391,15 @@ class SearchViewModel(container: AppContainer) : BaseListViewModel(container) {
         val requestOrder = order
         if (requestQuery.isBlank()) return Resource.Success(emptyList<ComicBriefDto>() to 0)
         if (page == 1) batchPager.reset()
-        return when (val result = batchPager.load(page) { sourcePage ->
+        val result = batchPager.load(page) { sourcePage ->
             var response = container.repository.search(requestQuery, sourcePage, requestOrder)
             if (sourcePage == 1 && response is Resource.Success && response.data.items.isEmpty() && response.data.total != 0) {
                 delay(800L)
                 response = container.repository.search(requestQuery, sourcePage, requestOrder)
             }
             response
-        }) {
+        }
+        return when (result) {
             is Resource.Success -> Resource.Success(result.data.items to result.data.total)
             is Resource.Error -> result
             Resource.Loading -> Resource.Loading
