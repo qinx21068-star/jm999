@@ -765,7 +765,7 @@ class DownloadManager(
 
     /**
      * 直连模式：下载禁漫图片并解密分割图后落盘。
-     * url 形如 https://cdn-msp.xxx/media/photos/{aid}/00047.webp?jm_sid=220980
+     * url 形如 https://cdn-msp.xxx/media/photos/{aid}/00047.webp?jm_sid={scrambleId}
      *
      * 关键修复（Bug 35）：之前无 GIF 判断，所有图片都走 decodeToBytes。
      * 但服务端对 GIF 不做切图，decodeToBytes 会：
