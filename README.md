@@ -1,88 +1,109 @@
-# 一根葱 (第三方 jmcomic2 客户端)
+# 一根葱
 
-> 干净、无广告的第三方 jmcomic2 客户端，仅作为访问接口的工具，不提供任何内容资源。
+> 干净、无广告的第三方 jmcomic2 客户端。仅作为访问接口的工具，不提供任何内容资源。
 
-一个基于 Jetpack Compose + Material 3 的现代 Android 漫画阅读器，专为流畅阅读体验而设计。支持直连与后端两种模式，离线下载、内容过滤、多域名测速切换等实用功能。
+基于 Kotlin + Jetpack Compose + Material 3 的 Android 漫画阅读器，支持直连与后端两种模式，内置离线下载、内容屏蔽、多线路测速、阅读进度记忆等。
+
+[下载最新版](https://github.com/qinx21068-star/jm999/releases/latest) · [MIT License](LICENSE)
 
 ---
 
-## 📦 版本历史
+## 下载安装
+
+| 项目 | 说明 |
+|---|---|
+| 安装包 | `app-release.apk`（通用包，含 arm64-v8a / armeabi-v7a / x86 / x86_64） |
+| 包名 | `com.yigencong`（可与旧版 `com.jmreader` 共存） |
+| 系统要求 | Android 7.0（API 24）及以上 |
+| 签名 | `yigencong` 正式密钥，APK Signature Scheme v2 |
+
+校验用证书指纹见 [docs/SIGNING.md](docs/SIGNING.md)。
+
+---
+
+## 主要功能
+
+- **阅读器**：上下滚动 / 左右翻页；双指连续缩放平移，放大后可单指拖动，竖向到边缘继续滚动，双击放大还原；沉浸全屏、音量键翻页、自动滚动、夜间滤镜、预加载下一章。
+- **搜索**：关键词（最新 / 观看 / 点赞 / 图片数）、标签、作者、批量 JM 号、搜索模板、以图搜图。
+- **书架**：本地收藏（分组 / 稍后再看）、站点收藏、浏览历史、阅读历史。
+- **下载**：整本下载、按图片续传、外部目录（SAF）、仅 Wi-Fi / 仅充电、并发控制、失败原因提示。
+- **内容屏蔽**：屏蔽标签 / 作者 / 名称关键词（繁简归一），可选完全隐藏或仅遮封面。
+- **讨论区与评论区**：紧凑排版，长文与回复可展开，JM 编号可点击跳转。
+- **网络**：域名池测速切换、自定义域名、图片质量档位、图片 CDN 锁定、网络诊断。
+- **数据与隐私**：备份 / 恢复（含导入预览与快照）、应用锁、隐身模式、禁止截图、通知栏稍后再看。
+
+---
+
+## 技术栈
+
+Kotlin 2.1.0 · Jetpack Compose（BOM 2024.12.01）+ Material 3 · MVVM + StateFlow · Navigation Compose · OkHttp（直连）/ Retrofit + Moshi（后端）· Coil · DataStore · Gradle 8.10.2 / AGP 8.7.3 · compileSdk 36
+
+---
+
+## 从源码构建
+
+```bash
+git clone https://github.com/qinx21068-star/jm999.git
+cd jm999
+
+# Android SDK 路径
+echo "sdk.dir=/path/to/Android/Sdk" > local.properties
+
+# Debug
+./gradlew :app:assembleDebug
+
+# Release（R8 混淆 + 资源压缩，需签名配置）
+./gradlew :app:assembleRelease
+```
+
+环境要求：JDK 17，Android SDK（compileSdk 36 / build-tools 36.0.0）。
+
+**正式版签名**：仓库不保存任何密钥。CI 通过 4 个 Actions 密钥（`ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_PASSWORD`、`ANDROID_KEY_ALIAS`）签名，未配置时 Release 任务会失败，不会产出未签名包。密钥保管与恢复流程见 [docs/SIGNING.md](docs/SIGNING.md)。
+
+---
+
+## 项目结构
+
+```
+jm999/
+├── app/src/main/java/com/jmreader/        # 源码包名 com.jmreader（applicationId 为 com.yigencong）
+│   ├── MainActivity.kt                    # 入口：闪屏、免责声明、主题、应用锁
+│   ├── core/                              # 日志、加解密、设备状态
+│   ├── data/
+│   │   ├── api/                           # 网络层（direct 直连 / 可选后端）
+│   │   ├── download/                      # 下载管理器
+│   │   ├── local/                         # DataStore 与本地存储
+│   │   ├── repository/                    # 仓库层（Resource 模式）
+│   │   └── AppContainer.kt                # 依赖注入
+│   └── ui/
+│       ├── components/                    # 通用组件（含卡片、评论）
+│       ├── nav/                           # 导航
+│       ├── theme/                         # Material 3 主题
+│       └── screen/                        # 页面：home / search / favorites / history /
+│                                          #       downloads / forum / comment / detail /
+│                                          #       reader / settings / imagesearch /
+│                                          #       author / lock / logs
+├── backend/                               # 可选 Python 后端（jmcomic）
+├── docs/SIGNING.md                        # 签名与密钥保管
+└── gradle/libs.versions.toml              # 依赖版本目录
+```
+
+---
+
+## 版本记录
 
 ### v1.3.1（2026-10-16）
+- 讨论区与评论区统一紧凑排版，长文 / 回复可展开，作品引用合并为单个附件。
+- 所有卡片显示 JM 号与真实发布日期，旧收藏后台补全元数据。
+- 阅读器支持双指连续缩放平移、放大后单指拖动、竖向边缘续滚、双击还原。
+- 随机入口移入「随机」页签；修复英文多词误判批量编号、自动搜索抢收键盘等问题。
+- 包名改为 `com.yigencong`，换用 `yigencong` 签名（与旧版共存）。
 
-**下载**：[Releases · v1.3.1](https://github.com/qinx21068-star/jm999/releases/tag/v1.3.1)
+### v1.3.0（2026-10-10）
+- 阅读器沉浸式全屏；CI 自动构建 Debug APK 与单元测试，`v*` 标签产出 Release。
+- 代理 / 图片 CDN / 下载并发设置提前应用；域名刷新保留自定义域名。
 
-**评论与讨论**
-- 讨论区与作品评论区统一为紧凑布局，正文不再被右侧封面挤窄。
-- 讨论区的作品引用合并为一个附件放在正文下方，不再重复书名。
-- 长评论与回复可展开／收起，保留 JM 编号跳转与复制。
-
-**作品卡片**
-- 所有卡片样式显示 JM 号与真实发布日期，编号可选中复制。
-- 旧收藏在后台分批补全缺失元数据并本地保存，不改变分组、排序与阅读进度。
-
-**阅读器**
-- 双指可边缩放边上下移动，放大后支持单指拖动。
-- 竖向阅读放大到视口边缘后继续滚动后续内容。
-- 双击放大／还原。
-
-**其他修正**
-- 首页顶部「从收藏／历史随机阅读」入口移入「随机」页签。
-- 英文多词关键词不再被误判为批量编号；自动搜索完成不再抢收键盘。
-- 下载目录授权失败会明确报错并保留原路径；下载失败展示原因。
-- 缓存清理范围与提示更准确，清除搜索历史增加确认。
-
-**打包与签名**
-- Android applicationId 为 `com.yigencong`，可与旧版 `com.jmreader` 共存安装。
-- 使用 `yigencong` Release 签名（APK Signature Scheme v2，RSA 4096 / SHA-512）。
-- Release 构建要求 GitHub Actions 配置签名 Secrets，未配置时会停止，不发布未签名正式包。
-- 旧版没有备份功能，新版不会自动读取旧版的应用私有数据；旧版仍保留在设备上。
-
-### v1.3.0（增量升级进行中）
-
-**本轮升级**
-- 新增阅读器沉浸式全屏：可隐藏系统状态栏/导航栏，点击屏幕显示控制栏，退出阅读器自动恢复。
-- GitHub Actions 自动构建 Debug APK、运行单元测试，并支持通过 `v*` 标签生成 Release APK。
-- 冷启动时提前应用代理、图片 CDN 和下载并发设置，避免首批请求绕过代理。
-- 下载器支持运行时同步代理，同时保留后端模式的独立图片代理请求链路。
-- 动态刷新 API 域名时保留用户自定义域名。
-- 下载路径读取最新设置，避免运行中切换目录后仍写入旧路径。
-- Release 密钥只通过 GitHub Secrets 使用，不提交到仓库。
-- 新安装包名为 `com.yigencong`，可与旧版 `com.jmreader` 共存；新版没有自动读取旧版私有数据的权限。
-
-### v1.1.0（2026-08-09）
-
-**评论区 / 讨论区**
-- 从 HTML 抓取（jm365 重定向，CF 拦截频繁失效）改为 `/forum` JSON API（token 鉴权 + AES 解密 + 域名轮换），加载稳定性大幅提升
-- 评论区返回后自动重载（之前首次失败后返回需手动重试）
-
-**屏蔽功能**
-- 新增 tags 持久化缓存，列表接口不返回 tags 的问题用缓存补全，第二次加载即时屏蔽
-- 修复 id 为空的条目在有 tag 规则时被永久隐藏的问题
-- 屏蔽规则订阅改用 `WhileSubscribed(5_000L)`，避免多 VM 实例并发订阅浪费
-
-**并发与竞态修复**
-- refresh 取消 loadMore/enrich Job，避免并发写 rawItems 竞态
-- enrich 改用全局缓存，不再依赖快照，loadMore/refresh 不影响 enrich 结果
-- 修复 `cid="0"` 评论 key 撞车导致 LazyColumn 崩溃
-- 修复 `getScrambleId` 失败兜底导致图片错位
-- 修复 `imageDomainList()` 返回可变列表引用的 CME 风险
-- DetailViewModel load / Reader preloadNextChapter 添加 Job 跟踪
-- forum 捕获 SessionExpiredException 并清理会话
-
-**性能优化**
-- DownloadManager 实现图片域名轮换（原单点下载易失败）
-- 优化临时文件清理策略，初始化时清理 .tmp 残留
-- Compose 稳定性配置声明 List/Set/Map 为 stable，减少不必要的重组
-- 阅读器空章节状态显示上一章/下一章按钮
-
-**代码清理**
-- 删除 HTML 抓取相关死代码（ForumHtmlFetcher / ForumRepository / CommentRepository / JmWebFetcher）
-- 清理对应的 proguard 规则和 stability 配置
-
-### v1.0.0（2026-07-06）
-
-首个正式版本。Jetpack Compose + Material 3 漫画阅读客户端，支持直连/后端双模式、离线下载、内容过滤、多域名测速切换。
+> 更早版本的变更见 [提交历史](https://github.com/qinx21068-star/jm999/commits/main)。
 
 ---
 
@@ -97,173 +118,16 @@
 5. 未成年人禁止使用本软件。
 6. 使用本软件即表示您已阅读并同意本声明。如不同意，请立即停止使用并删除本软件。
 
-**珍爱生命，爱护身体，理性使用，远离风险。**
-
-首次启动 App 会弹出上述声明，需阅读 5 秒后方可继续。也可在「设置 → 关于」随时查看。
+首次启动会弹出上述声明，需阅读 5 秒后方可继续；也可在「设置 → 关于」随时查看。
 
 ---
 
-## ✨ 功能特性
+## 贡献
 
-### 阅读体验
-- 📖 **双阅读模式**：上下滚动 / 左右翻页，可在设置中切换
-- 🎯 **章节恢复**：自动记忆上次阅读位置（漫画/章节/页码）
-- 🔢 **页码指示器 + 跳页滑块**：长文档快速定位
-- 🖼️ **图片缩放**：基于 Telephoto 的双指缩放与拖拽
-- ⚡ **高刷新率锁定**：自动启用屏幕最高刷新率（Android 11+），列表滚动更流畅
+欢迎提 Issue 或 PR。反馈时请附设备型号、Android 版本、App 版本，以及「设置 → 关于 → 查看日志」导出的日志。
 
-### 内容管理
-- 🔍 **多维度搜索**：关键词搜索（按最新/观看/评论/图片数排序）、按标签搜索、按作者搜索
-- 📚 **收藏 / 历史**：本地收藏夹 + 浏览历史
-- ⬇️ **离线下载**：整本下载，断点续传，原子落盘避免半成品文件，下载完整性校验
-- 🚫 **内容过滤**：屏蔽 Tag / 屏蔽作者 / 屏蔽名称关键词（繁简归一化匹配）
+**请勿在 Issue / PR 中粘贴密钥库、口令、Cookie 或任何凭据。**
 
-### 网络与连接
-- 🌐 **直连模式**（默认）：App 直接访问 API，单机即可使用，无需部署后端
-- 🛠️ **后端模式**（可选）：填后端地址走 Python `jmcomic` 库，适合需要服务端整本下载、Cookie 共享等场景
-- 🔄 **多域名测速切换**：内置域名池，支持测速选最优、自动拉取最新域名、添加自定义域名
-- 🔐 **账号登录**：可选登录以同步收藏/历史（登录防重复点击 + 错误反馈）
+## 许可证
 
-### UI 与个性化
-- 🎨 **Material 3 + 动态取色**：跟随壁纸生成配色（Android 12+）
-- 🌗 **三主题**：跟随系统 / 浅色 / 深色
-- 📱 **边缘到边缘**：适配全面屏
-
-### 其他
-- 🧭 **六大主页面**：首页（最新/排行）/ 搜索 / 收藏 / 下载 / 讨论区 / 设置
-- 🔎 **图片搜图**：集成 Saucenao 反向图片搜索（原图上传 + WebView 混合方案）
-- 📋 **日志诊断**：内置日志查看页，便于排查问题
-- 🛡️ **首次启动免责声明**：5 秒强制阅读 + 持久化
-
----
-
-## 📱 运行环境
-
-| 项目 | 要求 |
-|------|------|
-| 最低 Android 版本 | Android 7.0 (API 24) |
-| 目标 Android 版本 | Android 15 (API 36) |
-| 架构 | ARM64 / ARM32 / x86_64 |
-
----
-
-## 🛠️ 技术栈
-
-- **语言**：Kotlin
-- **UI**：Jetpack Compose + Material 3
-- **架构**：MVVM + ViewModel + StateFlow
-- **网络**：OkHttp + Retrofit + Moshi
-- **图片**：Coil + Telephoto（缩放）
-- **存储**：DataStore Preferences（设置）+ 文件系统（下载）
-- **导航**：Navigation Compose
-- **构建**：Gradle 8.10+ / AGP 8.7+ / Kotlin 2.0+
-
----
-
-## 🚀 从源码构建
-
-### 环境要求
-- JDK 17
-- Android SDK（compileSdk 36，build-tools 36.0.0）
-- Gradle 8.10+（项目自带 gradlew）
-
-### 步骤
-
-```bash
-# 1. 克隆仓库
-git clone https://github.com/<你的用户名>/JMReader.git
-cd JMReader
-
-# 2. 配置 SDK 路径（任选其一）
-#    方式 A：环境变量
-export ANDROID_HOME=/path/to/your/Android/Sdk
-#    方式 B：local.properties（首次构建自动生成，或手动创建）
-echo "sdk.dir=/path/to/your/Android/Sdk" > local.properties
-
-# 3. 签名密钥
-# 已创建的新版本密钥不会提交到 Git。请将 keystore 和密码备份到密码管理器。
-# 发布 Release 前，在仓库 Settings → Secrets and variables → Actions 中保存 4 个键值：
-#   ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD,
-#   ANDROID_KEY_PASSWORD, ANDROID_KEY_ALIAS
-# Permanently back up the keystore and credentials in a password manager; losing them prevents future updates.
-# 如果你需要为另一台机器新建 keystore，可用下面命令（密码应使用密码管理器生成）：
-# keytool -genkeypair -v -keystore release.keystore -storetype PKCS12 \\
-#   -alias yigencong -keyalg RSA -keysize 4096 -validity 10000
-
-# 4. 构建 Debug APK
-./gradlew :app:assembleDebug
-# 输出：app/build/outputs/apk/debug/app-debug.apk
-
-# 5. 构建 Release APK（含 R8 混淆 + 资源压缩）
-./gradlew :app:assembleRelease
-# 输出：app/build/outputs/apk/release/app-release.apk
-```
-
----
-
-## 🐍 后端（可选）
-
-`backend/` 目录是一个基于 [jmcomic](https://github.com/hect0x7/JMComic-Crawler-Python) 的 Python 后端示例，提供直连模式不具备的能力（整本下载、Cookie 共享等）。
-
-```bash
-cd backend
-pip install -r requirements.txt
-python main.py
-```
-
-详见 [backend/main.py](backend/main.py) 与 [backend/option.yaml](backend/option.yaml)。
-
-> 绝大多数用户无需部署后端，App 默认直连模式即可使用全部基础功能。
-
----
-
-## 📂 项目结构
-
-```
-JMReader/
-├── app/
-│   └── src/main/java/com/jmreader/
-│       ├── MainActivity.kt              # 入口，splash + 免责声明 + 主题
-│       ├── core/                        # 日志、加解密等基础设施
-│       ├── data/
-│       │   ├── api/                     # 网络层（直连 client + Saucenao）
-│       │   ├── download/                # 下载管理器
-│       │   ├── local/                   # DataStore + 本地存储
-│       │   ├── repository/              # 仓库层（Resource 模式）
-│       │   └── AppContainer.kt          # 依赖注入容器
-│       └── ui/
-│           ├── components/              # 通用组件 + 免责声明对话框
-│           ├── nav/                     # 导航
-│           ├── theme/                   # Material 3 主题
-│           └── screen/                  # 各页面（detail/downloads/favorites/
-│                                       #         forum/home/imagesearch/logs/
-│                                       #         reader/search/settings）
-├── backend/                            # 可选 Python 后端
-├── build.gradle.kts                    # 项目级构建
-├── settings.gradle.kts                 # 仓库镜像配置
-└── gradle/libs.versions.toml           # 依赖版本目录
-```
-
----
-
-## 🤝 贡献
-
-欢迎通过 Issue 反馈 bug 或提交 PR。提交前请：
-1. 确认 bug 可复现
-2. 附上日志（App 内「设置 → 关于 → 查看日志 / 诊断」可导出）
-3. 说明你的设备型号、Android 版本、App 版本
-
----
-
-## 📄 许可证
-
-[MIT License](LICENSE) — 仅供学习交流，不提供任何内容资源，使用者需遵守当地法律法规。
-
----
-
-## ⚠️ 重要提醒
-
-- 本项目**不提供任何漫画内容资源**，仅作为访问接口的工具。
-- 使用前请确认你所在国家/地区的法律法规允许此类工具的使用。
-- 请支持正版，尊重版权方权益。
-- 项目作者不对使用本软件产生的任何后果承担责任。
+[MIT License](LICENSE)
