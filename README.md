@@ -90,6 +90,20 @@ jm999/
 
 ---
 
+## 从旧版（com.jmreader）迁移
+
+旧版没有导出功能、`allowBackup=false`，且新旧包签名不同，**无法自动迁移**，只能手动取出数据文件：
+
+1. 用 root 文件管理器（或 `adb shell su`）进入 `/data/data/com.jmreader/files/`
+2. 复制 `favorites.json`、`history.json`、`browse_history.json`、`search_templates.json`
+3. 新版「设置 → 备份与恢复 → 从旧版导入」，选中这些文件 → 合并导入
+
+已升级到 v1.3.0 的用户可以直接用旧版「导出备份」，再在新版「导入备份」，无需 root。
+
+> 旧版数据一旦随卸载清除将无法恢复，升级前请先完成导出。
+
+---
+
 ## 版本记录
 
 ### v1.3.1（2026-10-16）
